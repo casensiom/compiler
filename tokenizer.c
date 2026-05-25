@@ -199,7 +199,7 @@ is_punctuation(char c) {
 }
 
 static void
-report_error(const char *filename, const char *start, const char *pos, const char *msg) {
+report_msg(const char *filename, const char *start, const char *pos, const char *msg) {
 
     size_t line = 1;
     const char *s = start;
@@ -231,8 +231,11 @@ report_error(const char *filename, const char *start, const char *pos, const cha
     }
     printf("^ %s\n", msg);
 
+}
 
-
+static void
+report_error(const char *filename, const char *start, const char *pos, const char *msg) {
+    report_msg(filename, start, pos, msg);
     abort();
 }
 
@@ -464,6 +467,7 @@ preprocess(Token *tok, File *file, State *state)
                 cur = it->next;
                 it->next = token_new(TKN_EOF, NULL, NULL);
 
+                // TODO: Check if already exists and warn if needed
                 AC_ARRAY_PUSH(state->macros, name);
                 continue;
             } else if(token_equal(command, "if", TKN_ID)) { 
@@ -537,7 +541,18 @@ preprocess(Token *tok, File *file, State *state)
                     report_error(file->name, file->content, command->pos, "No conditional block related with this close.");
                 }
             } else if(token_equal(command, "undef", TKN_ID)) {
-                TODO("Implement #undef");
+                Token *name = command->next;
+                if(name->type != TKN_ID || !name->is_eol) {
+                    report_msg(file->name, file->content, name->next->pos, "extra tokens at end of #undef directive");
+                }
+                
+                int pos = search_definition(state, name);
+                if(pos != -1) {
+                    AC_ARRAY_REMOVE(state->macros, pos);
+                // } else {
+                //     LOG_WARN("There is no macro defined as '%.*s'.", (int)name->len, name->pos);
+                }
+                cur = name;
             } else if(token_equal(command, "pragma", TKN_ID)) {
                 TODO("Implement #pragma");
             } else if(token_equal(command, "line", TKN_ID)) {
@@ -548,6 +563,8 @@ preprocess(Token *tok, File *file, State *state)
                 report_error(file->name, file->content, command->pos, "Unknown preprocessor command.");
             }
         } else {
+            // TODO! Check if the token is a macro and replace it!
+
             ccur->next = token_copy(cur);
             ccur = ccur->next;
         }
@@ -583,33 +600,28 @@ int main(int argc, const char **argv)
         Token *tok = tokenize(&file);
         if(tok == NULL) return 1;
         // 2) Preprocess (Iterate over the tokens and manage the #<ident> items)
-        // 3) Generate code (Iterate over the tokens and generate ASM code for each)
-
-
+        
         State state = {0};
         Token *out = preprocess(tok, &file, &state);
+        
+        // 3) Generate code (Iterate over the tokens and generate ASM code for each)
 
-
+        // DUMP 
         printf("[ TOKENS ]\n");
         Token *it = out;
         while(it != NULL) {
-            // printf(" - '%.*s' Type: %d\n", (int)it->len, it->pos, (int)it->type);
             printf("%.*s ", (int)it->len, it->pos);
             it = it->next;
         }
         printf("\n----\n");
-        
-        
         printf("[ MACROS ]\n");
         for(size_t i = 0; i < state.macros.count; ++i) {
             Token *t = state.macros.items[i];
             printf(" > %.*s\n", (int)t->len, t->pos);
         }
 
-
         // TODO: Destroy tokens
 
-        // Next steps, generalize and support features
         AC_ARRAY_DESTROY(content);
     }
     return 0;
