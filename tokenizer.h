@@ -18,7 +18,7 @@ typedef struct Args {
 
 typedef enum TokenKind {
     TKN_START,
-    TKN_IDENT,
+    TKN_ID,
     TKN_KEYWORD,
     TKN_NUMBER,
     TKN_STRING,
@@ -32,10 +32,14 @@ typedef struct Token {
     size_t len;
     size_t line;
     size_t column;
+    int is_eol;
+    int has_spaces;
     const char *filename;
-
+    
     struct Token *next;
 } Token;
+typedef Token * TokenPtr;
+AC_ARRAY_DEFINE(TokenPtr);
 
 typedef struct File {
     const char *name;
@@ -49,6 +53,14 @@ typedef struct FileContent {
     size_t line_start;
     size_t line_end;
 } FileContent;
+
+typedef struct State {
+    size_t cond_block_level;
+    TokenPtrArray macros;
+    StringArray included;
+    // VariableArray vars;
+    // MethodArray methods;
+} State;
 
 
 #endif
