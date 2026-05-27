@@ -6,14 +6,14 @@
 typedef char Char;
 AC_ARRAY_DEFINE(Char);
 
-typedef CharArray String;
-AC_ARRAY_DEFINE(String);
+typedef char* CharPtr;
+AC_ARRAY_DEFINE(CharPtr);
 
-typedef  const char * FileName;
-AC_ARRAY_DEFINE(FileName);
+typedef const char* ConstCharPtr;
+AC_ARRAY_DEFINE(ConstCharPtr);
 
 typedef struct Args {
-    FileNameArray list;
+    ConstCharPtrArray file_list;
 } Args;
 
 typedef enum TokenKind {
@@ -26,20 +26,34 @@ typedef enum TokenKind {
     TKN_EOF
 } TokenKind;
 
+typedef struct TokenLoc {
+    size_t line;
+    size_t column;
+    const char *filename;
+} TokenLoc;
+
 typedef struct Token {
     TokenKind type;
     const char *pos;
     size_t len;
-    size_t line;
-    size_t column;
     int is_eol;
     int has_spaces;
-    const char *filename;
+    
+    TokenLoc location;
     
     struct Token *next;
+    // --
+    struct Token *from_macro; // if expanded from object-like macro
+    char *value; // if composed macro ## 
 } Token;
 typedef Token * TokenPtr;
 AC_ARRAY_DEFINE(TokenPtr);
+
+typedef struct MacroArg { 
+    Token* macro;
+    Token* code;
+} MacroArg;
+AC_ARRAY_DEFINE(MacroArg);
 
 typedef struct File {
     const char *name;
@@ -57,10 +71,20 @@ typedef struct FileContent {
 typedef struct State {
     size_t cond_block_level;
     TokenPtrArray macros;
-    StringArray included;
+    CharPtrArray included;
     // VariableArray vars;
     // MethodArray methods;
 } State;
 
+typedef struct TokenizerError {
+    const char *pos;
+    const char *message;
+} TokenizerError;
+
+
+
+static Token *tokenize_literal(const char *pos, TokenLoc token_loc, TokenizerError *error);
+static Token *tokenize_string(const char *pos, TokenLoc token_loc, TokenizerError *error);
+static Token *tokenize_number(const char *pos, TokenLoc token_loc, TokenizerError *error);
 
 #endif

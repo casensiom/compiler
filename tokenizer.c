@@ -1,16 +1,20 @@
 #include "tokenizer.h"
 
+
+#define EXECUTE_UNIT_TEST
+#include "test/tests.h"
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/errno.h>
 #include <stdarg.h>
 #include <string.h>
 
-#define TRACE_ERROR(level, fmt, ...)                             \
-    do                                                           \
-    {                                                            \
+#define TRACE_ERROR(level, fmt, ...)                                \
+    do                                                              \
+    {                                                               \
         log_msg_(__FILE__, __LINE__, 0, level, fmt, ##__VA_ARGS__); \
-        abort();                                                 \
+        abort();                                                    \
     } while (0)
 
 #define FATAL(fmt, ...) TRACE_ERROR("[FATAL]", fmt, ##__VA_ARGS__)
@@ -90,7 +94,7 @@ static Args
 parse_args(int argc, const char **argv)
 {
     Args args = {0};
-    args.list = AC_ARRAY_CREATE(FileName, 16);
+    args.file_list = AC_ARRAY_CREATE(ConstCharPtr, 16);
 
     const char *program = shift(&argc, &argv);
     UNUSED(program);
@@ -102,7 +106,7 @@ parse_args(int argc, const char **argv)
         {
             break;
         }
-        AC_ARRAY_PUSH(args.list, param);
+        AC_ARRAY_PUSH(args.file_list, param);
     }
     return args;
 }
@@ -116,7 +120,7 @@ copy_string(const char *str, size_t len) {
 }
 
 static Token *
-token_new(TokenKind type, const char *start, const char *end)
+token_new(TokenKind type, const char *start, const char *end, TokenLoc location)
 {
     Token *tok = calloc(1, sizeof(Token));
     tok->type = type;
@@ -124,22 +128,44 @@ token_new(TokenKind type, const char *start, const char *end)
     tok->len = end - start;
     tok->is_eol = 0;
     tok->has_spaces = 0;
+
+    tok->location = location;
+
     tok->next = NULL;
 
     return tok;
 }
 
-// static void
-// token_dump(Token *t) {
-//     printf(" > TOKEN(%p): %.*s [%d]\n", t->pos, (int)t->len, t->pos, t->type);
-// }
+static void
+token_dump(Token *t) {
+    printf(" > TOKEN(%p): %.*s [%d]\n", t->pos, (int)t->len, t->pos, t->type);
+}
+
+static void
+token_full_dump(Token *t) {
+    printf(" > FULL DUMP (%p): ", t->pos);
+    while(t && t->type != TKN_EOF) {
+        printf(" %.*s", (int)t->len, t->pos);
+        t = t->next;
+    }
+    if(t == NULL) {
+        printf("$");
+    }
+    printf("\n");
+}
 
 static Token *
 token_copy(Token *src) 
 {
     Token *tok = calloc(1, sizeof(Token));
     *tok = *src;
+    tok->next = NULL;
     return tok;
+}
+
+static int
+token_equals(Token *l, Token *r) {
+    return (l && r && l->type == r->type && l->len == r->len && strncmp(l->pos, r->pos, l->len) == 0);
 }
 
 static int
@@ -161,6 +187,25 @@ token_equal(Token *tok, const char *tag, TokenKind type) {
     }
     #endif
     return (tok && type == tok->type && strlen(tag) == tok->len && strncmp(tok->pos, tag, tok->len) == 0);
+}
+
+static Token *
+token_merge(Token *t1, Token *t2) {
+    Token copy;
+    Token *cur = &copy;
+
+    if(t1 == NULL || t1->type == TKN_EOF) {
+        return t2;
+    }
+
+    while(t1->type != TKN_EOF) {
+        cur->next = token_copy(t1);
+        t1 = t1->next;
+        cur = cur->next;
+    }
+    cur->next = t2;
+    
+    return copy.next;
 }
 
 static int
@@ -185,17 +230,78 @@ static int
 is_ident(char c) {
     return is_digit(c) || is_alpha(c) || c == '_';
 }
+
 static int
-is_punctuation(char c) {
+is_punctuation(const char *p) {
     // TODO: first chech punctuation combinations
-    // return c == '<' || c == '>' || c == '='|| c == '!'|| c == '&'|| c == '|'|| c == '%'|| c == '+'|| c == '-'|| c == '/' || c == '*' || c == '.';
-    return c == '!' || c == '"' || c== '#' || c == '$' || c == '%' ||
+    static char *kw[] = {
+        "<<=", ">>=", "...", "==", "!=", "<=", ">=", "->", "+=",
+        "-=", "*=", "/=", "++", "--", "%=", "&=", "|=", "^=", "&&",
+        "||", "<<", ">>", "##",
+    };
+    size_t N = sizeof(kw) / sizeof(*kw);
+    for(size_t i = 0;i < N;++i) {
+        char *q = kw[i];
+        size_t len = strlen(q);
+        if(strncmp(p, q, len) == 0) {
+            return len;
+        }
+    }
+
+    char c = *p;
+    if (c == '!' || c == '"' || c== '#' || c == '$' || c == '%' ||
         c == '&' || c == '\'' || c== '(' || c == ')' || c == '*' ||
         c == '+' || c == ',' || c== '-' || c == '.' || c == '/' ||
         c == ':' || c == ';' || c== '<' || c == '=' || c == '>' ||
         c == '?' || c == '@' || c== '[' || c == '\\' || c == ']' ||
         c == '^' || c == '_' || c== '`' || c == '{' || c == '|' ||
-        c == '}' || c ==  '~';
+        c == '}' || c ==  '~')
+        return 1;
+    return 0;
+}
+
+static int
+get_number_len(size_t num) {
+    size_t len = 1;
+    while(num >= 10) {
+        num /= 10;
+        len++;
+    }
+    return len;
+}
+
+static void
+report_token(Token *tok, const char *start, const char *msg) {
+    const char *s;
+    
+    s = tok->pos;
+    while(s>start && *s != '\n') {
+        s--;
+    }
+    const char *line_start = s + 1;
+
+    s = tok->pos;
+    while(*s != '\0' && *s != '\n') {
+        s++;
+    }
+    const char *line_end = s - 1;
+
+    int len = line_end - line_start + 1;
+    size_t line = tok->location.line + 1;
+    size_t column = tok->location.column;
+
+
+    log_msg_(tok->location.filename, line, column + 1, "error:", msg);
+    printf(" %lu | %.*s\n", line, len, line_start);
+    size_t line_counter_len = get_number_len(line);
+    for(size_t i = 0; i < line_counter_len + 2; i++) {
+        printf(" ");
+    }
+    printf("| ");
+    for(size_t i = 0; i < column; i++) {
+        printf(" ");
+    }
+    printf("^ %s\n", msg);
 }
 
 static void
@@ -209,28 +315,38 @@ report_msg(const char *filename, const char *start, const char *pos, const char 
         }
         s++;
     }
-    
+
     s = pos;
     while(s>start && *s != '\n') {
         s--;
     }
-    const char *line_start = s;
+    const char *line_start = s + 1;
     s = pos;
     while(s && *s != '\n') {
         s++;
     }
-    const char *line_end = s;
-    
-    
+    const char *line_end = s - 1;
+
     int len = line_end - line_start;
-    int column = pos - line_start;
+    size_t column = pos - line_start;
     log_msg_(filename, line, column, "error:", msg);
-    printf("%.*s\n", len, line_start);
-    for(int i = 0; i < column - 1; i++) {
+    printf(" %lu | %.*s\n", line, len, line_start);
+    size_t line_counter_len = get_number_len(line);
+    for(size_t i = 0; i < line_counter_len + 2; i++) {
+        printf(" ");
+    }
+    printf("| ");
+    for(size_t i = 0; i < column; i++) {
         printf(" ");
     }
     printf("^ %s\n", msg);
 
+}
+
+static void
+report_error_token(Token *tok, const char *start, const char *msg) {
+    report_token(tok, start, msg);
+    abort();
 }
 
 static void
@@ -240,12 +356,219 @@ report_error(const char *filename, const char *start, const char *pos, const cha
 }
 
 static Token *
+tokenize_number(const char *pos, TokenLoc token_loc, TokenizerError *error) {
+    Token *token = NULL;
+    const char *p = pos;
+    error->pos = p;
+    error->message = NULL;
+
+    // ([0-9]+(\.[0-9]*)?|\.[0-9]+)[eE][+-]?[0-9]+
+    if(is_digit(p[0]) || (p[0] == '.' && is_digit(p[1]))) {
+        const char *q = p;
+        int has_dot = 0;
+        int has_exp = 0;
+        int has_sig = 0;
+        do {
+            if(p[0] == '.') {
+                if(has_dot) {
+                    error->message = "Invalid dot in decimal number.";
+                    break;
+                }
+                if(has_exp) {
+                    error->message = "Invalid dot in exponent.";
+                    break;
+                }
+                has_dot = 1;
+            } else if(p[0] == 'e' || p[0] == 'E' ) {
+                if(has_exp) {
+                    error->message = "Invalid exponent in scientific notation";
+                    break;
+                }
+                has_exp = 1;
+                if(p[1] != '\0') {
+                    p++;
+                    if (p[0] == '+' || p[0] == '-') {
+                        if(has_sig) {
+                            error->pos = p;
+                            error->message = "Invalid sign in scientific notation";
+                            break;
+                        }
+                        has_sig = 1;
+                        if(p[1] == '\0') {
+                            error->pos = p+1;
+                            error->message = "Unexpected end of file after exponent sign.";
+                            break;
+                        } else if(!is_digit(p[1])) {
+                            error->pos = p+1;
+                            error->message = "Invalid character after exponent sign.";
+                            break;
+                        }
+                    } else if(!is_digit(p[0])) {
+                        error->pos = p;
+                        error->message = "Invalid character after exponent.";
+                        break;
+                    }
+                } else {
+                    error->pos = p+1;
+                    error->message = "Unexpected end of file after exponent.";
+                    break;
+                }
+            } else if(!is_digit(*p)) {
+                break;
+            }
+            p++;
+        } while(1);
+
+        if(error->message == NULL) {
+            token = token_new(TKN_NUMBER, q, p, token_loc);
+        }
+    }
+    return token;
+}
+
+static int
+ensure_string_len(const char *pos, size_t len) {
+    size_t i = 0;
+    while(pos[i] != '\0' && pos[i] != '"' && i < len) {
+        i++;
+    }
+    return i == len;
+}
+
+static size_t
+read_escape_sequence(const char *pos) {
+    const char *p = pos;
+    size_t len = 0;
+    if(*p == '\\') {
+        p++;
+        if(*p == '\0') {
+            return 0;
+        }
+    
+        if( *p == 'n') { len = 2; }
+        else if( *p == 't') { len = 2; }
+        else if( *p == 'r') { len = 2; }
+        else if( *p == '\\') { len = 2; }
+        else if( *p == '"') { len = 2; }
+        else if( *p == '\'') { len = 2; }
+        else if( *p == '0') { len = 2; }
+        else if( *p == 'x' && ensure_string_len(p, 1 + 2)) { len = 2 + 2; }
+        else if( *p == 'u' && ensure_string_len(p, 1 + 4)) { len = 2 + 4; }
+        else if( *p == 'U' && ensure_string_len(p, 1 + 8)) { len = 2 + 8; }
+    }
+    return len;
+}
+
+static Token *
+tokenize_string(const char *pos, TokenLoc token_loc, TokenizerError *error) {
+    Token *token = NULL;
+    const char *p = pos;
+    error->pos = p;
+    error->message = NULL;
+    
+    int skip_len = 0;
+    int is_string = 0;
+    if(*p == '"') {
+        skip_len = 1;
+        is_string = 1;
+    } else if(strncmp(p, "u8\"", 3) == 0) {
+        skip_len = 3;
+        is_string = 1;
+    } else if(strncmp(p, "u\"", 2) == 0) {
+        skip_len = 2;
+        is_string = 1;
+    } else if(strncmp(p, "L\"", 2) == 0) {
+        skip_len = 2;
+        is_string = 1;
+    } else if(strncmp(p, "U\"", 2) == 0) {
+        skip_len = 2;
+        is_string = 1;
+    }
+
+    if(is_string == 1) {
+        const char *q = p;
+        p += skip_len;
+        while(*p != '"') {
+            if(*p == '\0') {
+                error->pos = p;
+                error->message = "Unclosed string.";
+                break;
+            }
+            if(*p == '\n' || *p == '\r') {
+                error->pos = p;
+                error->message = "Break line inside string.";
+                break;
+            }
+            if (*p == '\\') {
+                size_t len = read_escape_sequence(p);
+                if(len > 0) {
+                    p += len - 1;
+                } else {
+                    error->pos = p;
+                    error->message = "Invalid escape senquence.";
+                    break;
+                }
+            }
+            p++;
+        }
+        if(error->message == NULL) {
+            p++;
+            token = token_new(TKN_STRING, q, p, token_loc);
+        }
+    }
+    return token;
+}
+
+static Token *
+tokenize_literal(const char *pos, TokenLoc token_loc, TokenizerError *error) {
+    Token *token = NULL;
+    const char *p = pos;
+    error->pos = p;
+    error->message = NULL;
+    
+    if(*p == '\'') {
+        const char *q = p;
+        p++;
+        while(*p != '\'') {
+            if(*p == '\0') {
+                error->pos = p;
+                error->message = "Unclosed literal.";
+                break;
+            }
+            if(*p == '\n' || *p == '\r') {
+                error->pos = p;
+                error->message = "Break line inside literal.";
+                break;
+            }
+            if (*p == '\\') {
+                size_t len = read_escape_sequence(p);
+                if(len > 0) {
+                    p += len - 1;
+                } else {
+                    error->pos = p;
+                    error->message = "Invalid escape senquence.";
+                    break;
+                }
+            }
+            p++;
+        }
+        if(error->message == NULL) {
+            p++;
+            token = token_new(TKN_NUMBER, q, p, token_loc);
+        }
+    }
+    return token;
+}
+
+static Token *
 tokenize(File *file) {
 
     // TODO: use utf8 to read characters
     Token head = {0};
     Token *cur = &head;
+    TokenLoc token_loc = {0};
 
+    token_loc.filename = file->name;
     const char *p = file->content;
     while(*p) {
         if(strncmp(p, "//" , 2) == 0) {
@@ -260,6 +583,10 @@ tokenize(File *file) {
             const char *q = p;
             p += 2;
             do {
+                if(*p == '\n') {
+                    token_loc.line++;
+                    token_loc.column = 0;
+                }
                 while(*p != 0 && *p != '*') {
                     p++;
                 }
@@ -277,97 +604,87 @@ tokenize(File *file) {
         if(is_space(*p)) {
             cur->has_spaces = 1;
             p++;
+            token_loc.column++;
             continue;
         }
 
         // TODO: remove this check, that should be part of the pre cleaning
         if(p[0] == '\\' && p[1] == '\n') {
             p += 2;
+            token_loc.column = 0;
+            token_loc.line++;
             continue;
         }
-
 
         if(*p == '\n') {
             cur->is_eol = 1;
             p++;
+            token_loc.column = 0;
+            token_loc.line++;
             continue;
         }
 
-        if(is_digit(p[0]) || (p[0] == '.' && is_digit(p[1]))) {
-            const char *q = p; 
-            // TODO: Be more strict, support scientific notation and check valid values
-            while(is_digit(*p) || p[0] == '.') {
-                p++;
-            }
-            cur->next = token_new(TKN_NUMBER, q, p);
+        Token *t = NULL;
+        TokenizerError error = {0};
+        t = tokenize_number(p, token_loc, &error);
+        if(t != NULL) {
+            cur->next = t;
             cur = cur->next;
+            token_loc.column += cur->len;
+            p += cur->len;
             continue;
+        } else if(error.message != NULL){
+            report_error(file->name, file->content, error.pos, error.message);
         }
 
-        if(p[0] == '"') {
-            const char *q = p;
-            p++;
-            while(*p != '"') {
-                if(*p == '\0') {
-                    report_error(file->name, file->content, q, "Unclosed string.");
-                }
-                if(*p == '\n') {
-                    report_error(file->name, file->content, q, "Break line inside string.");
-                }
-                if (*p == '\\') {
-                    p++;
-                }
-                p++;
-            }
-            p++;
-            cur->next = token_new(TKN_STRING, q, p);
+        t = tokenize_string(p, token_loc, &error);
+        if(t != NULL) {
+            cur->next = t;
             cur = cur->next;
+            token_loc.column += cur->len;
+            p += cur->len;
             continue;
+        } else if(error.message != NULL){
+            report_error(file->name, file->content, error.pos, error.message);
         }
-        if(p[0] == '\'') {
-            const char *q = p;
-            p++;
-            while(*p != '\'') {
-                if(*p == '\0') {
-                    report_error(file->name, file->content, q, "Unclosed literal.");
-                }
-                if(*p == '\n') {
-                    report_error(file->name, file->content, q, "Break line inside literal.");
-                }
-                if (*p == '\\') {
-                    // report_error(file->name, file->content, q, "Parse escape sequence in literal");
-                    p++;
-                }
-                p++;
-            }
-            p++;
-            cur->next = token_new(TKN_NUMBER, q, p);
+
+        t = tokenize_literal(p, token_loc, &error);
+        if(t != NULL) {
+            cur->next = t;
             cur = cur->next;
+            token_loc.column += cur->len;
+            p += cur->len;
             continue;
+        } else if(error.message != NULL){
+            report_error(file->name, file->content, error.pos, error.message);
         }
         
+
         if(is_ident_start(*p)) {
             const char *q = p;
             p++;
             while(is_ident(*p)) {
                 p++;
             }
-            cur->next = token_new(TKN_ID, q, p);
+            cur->next = token_new(TKN_ID, q, p, token_loc);
             cur = cur->next;
+            token_loc.column += cur->len;
             continue;
         }
         
-        if(is_punctuation(*p)) {
+        size_t len = is_punctuation(p);
+        if(len > 0) {
             const char *q = p;
-            p++;
-            cur->next = token_new(TKN_PUNCTUATION, q, p);
+            p += (len );
+            cur->next = token_new(TKN_PUNCTUATION, q, p, token_loc);
             cur = cur->next;
+            token_loc.column += cur->len;
             continue;
         }
         printf("Unexpected token '%c' -> %d | 0x%X\n", *p, (int)*p, (int)*p);
         report_error(file->name, file->content, p, "Unexpected token.");
     }
-    cur->next = token_new(TKN_EOF, p, p);
+    cur->next = token_new(TKN_EOF, p, p, token_loc);
     return head.next;
 }
 
@@ -383,9 +700,9 @@ file_tokenize(const char *filename) {
 }
 
 int
-search_definition(State *state, Token *def) {
+macro_search(State *state, Token *def) {
     int pos = -1;
-    for (size_t i = 0; i < (state->macros).count; i++) { 
+    for (size_t i = 0;i < (state->macros).count;i++) { 
         if ((state->macros).items[i]->len == def->len && 
             strncmp(def->pos, ((state->macros).items[i]->pos), def->len) == 0) { 
                 pos = i;
@@ -394,6 +711,199 @@ search_definition(State *state, Token *def) {
     }
     return pos;
 }
+
+static Token * 
+macro_param_search(MacroArgArray *args, Token *tok) {
+    Token *ret = NULL;
+    for(size_t i = 0;i < args->count;i++) {
+        if(token_equals(args->items[i].macro, tok)) {
+            ret = args->items[i].code;
+            break;
+        }
+    }
+    return ret;
+}
+
+MacroArgArray
+macro_param_collect(Token **macro, Token **tok, const char *content) {
+    MacroArgArray args = {0};
+    Token *it = *tok;
+    Token *it2 = *macro;
+
+    if(!token_equal(it, "(", TKN_PUNCTUATION) || !token_equal(it2, "(", TKN_PUNCTUATION)) {
+        report_error_token(it2, content, "Function-like macro requires parameters.");
+    }
+    
+    while(!token_equal(it, ")", TKN_PUNCTUATION)) {
+        it = it->next;
+        it2 = it2->next;
+        if(!it || it->type == TKN_EOF || !it2 || it2->type == TKN_EOF) {
+            report_error_token(it, content, "Unexpected error parsing macro parameters.");
+        }
+
+        printf("Collecting code parameters!\n");
+        Token param_code;
+        Token *copy_code = &param_code;
+        while(!token_equal(it, ",", TKN_PUNCTUATION) && !token_equal(it, ")", TKN_PUNCTUATION)) {
+            printf("  '%.*s'\n", (int)it->len, it->pos);
+            copy_code->next = token_copy(it);
+            copy_code = copy_code->next;
+            it = it->next;
+        }
+        
+        printf("Collecting macro parameters!\n");
+        Token param_macro;
+        Token *copy_macro = &param_macro;
+        while(!token_equal(it2, ",", TKN_PUNCTUATION) && !token_equal(it2, ")", TKN_PUNCTUATION)) {
+            printf("  '%.*s'\n", (int)it2->len, it2->pos);
+            copy_macro->next = token_copy(it2);
+            copy_macro = copy_macro->next;
+            it2 = it2->next;
+        }
+        
+        if(!token_equals(it, it2)) {
+            report_error_token(it, content, "Macro parameters doesn't match definition.");
+        }
+
+        MacroArg arg = {.macro = param_macro.next, .code = param_code.next};
+        AC_ARRAY_PUSH(args, arg);
+    }
+
+    *tok = it->next;
+    *macro = it2->next;
+    return args;
+}
+
+
+static Token * 
+macro_expand(Token *macro, Token *tok, const char *content) {
+    UNUSED(content);
+    if(macro->has_spaces) { 
+        // object-like
+        return token_merge(macro->next, tok->next);
+    } else if(token_equal(macro->next, "(", TKN_PUNCTUATION)) { 
+        // function-like
+        Token *m = macro->next;
+        Token *c = tok->next;
+
+        MacroArgArray args = macro_param_collect(&m, &c, content);
+        
+        LOG_DEBUG("FULL MACRO:");
+        token_full_dump(m);
+        LOG_DEBUG("FULL CODE:");
+        token_full_dump(c);
+        
+        Token copy;
+        Token *cur = &copy;
+        while(m && m->type != TKN_EOF) {
+            
+            Token *replacement = macro_param_search(&args, m);
+            if(replacement != NULL) {
+
+                
+                cur->next = replacement;
+                printf("Found replacement  '%.*s' -> ", (int)m->len, m->pos);
+                size_t counter = 0;
+                while(cur->next != NULL && cur->next->next != NULL) {
+                    cur = cur->next;
+                    printf(" + '%.*s'", (int)cur->len, cur->pos);
+                    counter ++;
+                    if(counter > 10) {
+                        return NULL;
+                    }
+                }
+                printf("\n");
+                
+                // FIX: can't use these tokens directly, they must be copied, 
+                // otherwise it loses the end point.
+                // To fix it fast just copy the end token, so its next value
+                // can point to any other token.
+                cur->next = token_copy(cur->next);
+
+            } else {
+                printf(" - COPY TOKEN '%.*s'", (int)m->len, m->pos);
+                cur->next = token_copy(m);
+            }
+            m = m->next;
+            cur = cur->next;
+            token_full_dump(copy.next);
+        }
+        cur->next = c->next;
+        token_full_dump(copy.next);
+        return copy.next;
+    }
+    return NULL;
+}
+
+/*
+static Token * 
+expand_macro2(Token *macro, Token **tok, const char *content) {
+    printf("MACRO (%p) '%.*s'\n", macro, (int)macro->len, macro->pos);
+    printf("*TOK (%p) '%.*s'\n", (*tok), (int)(*tok)->len, (*tok)->pos);
+    if(token_equal(macro->next, "(", TKN_PUNCTUATION)) {
+        // its a function like
+        if(!token_equal((*tok)->next, "(", TKN_PUNCTUATION)) {
+            report_error_token(*tok, content, "Function macro requires parameters.");
+        }
+
+        // Collect args
+        MacroArgArray args = {0};
+        Token *it = *tok;
+        Token *it2 = macro;
+        while(!token_equal(it, ")", TKN_PUNCTUATION)) {
+            it = it->next;
+            it2 = it2->next;
+            token_dump(it);
+            if(it->type != TKN_ID) {
+                continue;
+            }
+            if(it->type == it2->type) {
+                printf("  ARG '%.*s' -> '%.*s'\n", (int)it2->len, it2->pos, (int)it->len, it->pos);
+                MacroArg arg = {.macro = token_copy(it2), .code = token_copy(it)};
+                AC_ARRAY_PUSH(args, arg);
+            } else {
+                report_error_token(*tok, content, "Incompatibility params on macro.");
+            }
+        }
+
+        Token copy;
+        Token *cur = &copy;
+        // Token *prev = NULL;
+
+        it2 = it2->next;
+        it = it->next;
+        //traverse macro tokens, replacing args
+        printf("  TRANSLATE :\n");
+        while(it2->type != TKN_EOF) {
+            if(token_equal(it2, "#", TKN_PUNCTUATION) && token_equal(it2->next, "#", TKN_PUNCTUATION) ) {
+                it2 = it2->next->next;
+                // TODO: Should join both tokens in one
+                continue;
+            }
+            Token *arg = args_find(&args, it2);
+            if(arg != NULL) {
+                cur->next = token_copy(arg);
+            } else {
+                cur->next = token_copy(it2);
+            }
+            // prev = cur;
+            it2 = it2->next;
+            cur = cur->next;
+            printf(" %.*s ", (int)cur->len, cur->pos);
+        }
+        
+        printf("\n:  TRANSLATED\n");
+        *tok = it;
+        
+        cur->next = it;
+        printf(" Last! %.*s ", (int)it->len, it->pos);
+        printf("*TOK (%p) '%.*s'\n", (*tok), (int)(*tok)->len, (*tok)->pos);
+        return copy.next;
+    } else {
+        return token_merge(macro, (*tok)->next);
+    }
+}
+*/
 
 Token *
 preprocess(Token *tok, File *file, State *state) 
@@ -432,9 +942,8 @@ preprocess(Token *tok, File *file, State *state)
                     printf("-> SKIP INCLUDE %.*s\n", (int)include_path_len, include_path);
                 } else {
                     // TODO: Adjust line count reference
-                    Token *include_tokens = NULL;
                     char *filename = copy_string(include_path+1, include_path_len - 2);
-                    include_tokens = file_tokenize(filename);
+                    Token *include_tokens = file_tokenize(filename);
                     if(include_tokens != NULL) {
                         Token *it = include_tokens;
                         while(it->next != NULL && it->next->type != TKN_EOF) {
@@ -453,7 +962,7 @@ preprocess(Token *tok, File *file, State *state)
                 // dump_token(command);
                 Token *name = command->next;
                 if(name->type != TKN_ID) {
-                    report_error(file->name, file->content, name->pos, "Expected a MARO identifier.");
+                    report_error_token(name, file->content, "Expected a MARO identifier.");
                 }
                 
                 Token *it = cur;
@@ -465,88 +974,75 @@ preprocess(Token *tok, File *file, State *state)
                 printf(" %.*s", (int)it->len, it->pos);
                 printf("\n");
                 cur = it->next;
-                it->next = token_new(TKN_EOF, NULL, NULL);
+                TokenLoc location = {.filename = file->name, .line = -1, .column = -1};
+                it->next = token_new(TKN_EOF, NULL, NULL, location);
 
                 // TODO: Check if already exists and warn if needed
                 AC_ARRAY_PUSH(state->macros, name);
                 continue;
-            } else if(token_equal(command, "if", TKN_ID)) { 
-                int remove = 0;
-                Token *cond = command->next;
-                if(cond->type == TKN_NUMBER) {
-                    if(atoi(cond->pos) == 0) {
-                        remove = 1;
-                    }
-                } else if(cond->type == TKN_ID) {
-                    int pos = search_definition(state, cond);
-                    if(pos != -1) {
-                        Token *def = state->macros.items[pos];
-                        if(!def->is_eol && def->next->type == TKN_NUMBER && atoi(def->next->pos) == 0) {
-                            remove = 1;
-                        }
-                    }
-                }
-                
-                state->cond_block_level++;
-                if(remove) {
-                    while(cur->type != TKN_EOF) {
-                        cur = cur->next;
-                        if(token_equal(cur, "#", TKN_PUNCTUATION) &&
-                            token_equal(cur->next, "endif", TKN_ID)) {
-                                state->cond_block_level--;
-                                cur = cur->next;
-                                break;
-                        }
-                    }
-                }
-
-            } else if(token_equal(command, "ifdef", TKN_ID) ||
+            } else if(token_equal(command, "if", TKN_ID) ||
+                    token_equal(command, "ifdef", TKN_ID) ||
                     token_equal(command, "ifndef", TKN_ID)) { 
+                int skip_block = 0;
 
-                // TODO("Implement #ifdef");
-                int must_be_defined = 0;
-                if(token_equal(command, "ifdef", TKN_ID)) {
-                    must_be_defined = 1;
-                }
-                Token *def = command->next;
-                int pos = search_definition(state, def);
-                cur = def;
-                
-                // skip the entire block
-                state->cond_block_level++;
-                if((must_be_defined == 0 && pos != -1) || 
-                    (must_be_defined == 1 && pos == -1)) {
-
-                    while(cur->type != TKN_EOF) {
-                        cur = cur->next;
-                        if(token_equal(cur, "#", TKN_PUNCTUATION) &&
-                            token_equal(cur->next, "endif", TKN_ID)) {
-
-                                state->cond_block_level--;
-                                cur = cur->next;
-                                break;
+                if(token_equal(command, "if", TKN_ID)) {
+                    Token *cond = command->next;
+                    if(cond->type == TKN_NUMBER) {
+                        if(atoi(cond->pos) == 0) {
+                            skip_block = 1;
+                        }
+                    } else if(cond->type == TKN_ID) {
+                        int pos = macro_search(state, cond);
+                        if(pos != -1) {
+                            Token *def = state->macros.items[pos];
+                            if(!def->is_eol && def->next->type == TKN_NUMBER && atoi(def->next->pos) == 0) {
+                                skip_block = 1;
+                            }
                         }
                     }
+                } else {
+                    Token *def = command->next;
+                    int pos = macro_search(state, def);
+                    if(token_equal(command, "ifdef", TKN_ID)) {
+                        skip_block = (pos == -1);
+                    } else {
+                        skip_block = (pos != -1);
+                    }
+                }
+                
+                state->cond_block_level++;
+                printf("COND BLOCK LEVEL UP: %lu\n", state->cond_block_level);
+                if(skip_block) {
+                    while(cur->type != TKN_EOF) {
+                        cur = cur->next;
+                        if(token_equal(cur, "#", TKN_PUNCTUATION) && token_equal(cur->next, "endif", TKN_ID)) {
+                            state->cond_block_level--;
+                            cur = cur->next;
+                            break;
+                        }
+                    }
+                } else {
+                    cur = command->next;
                 }
             } else if(token_equal(command, "elif", TKN_ID)) { 
                 TODO("Implement #elif");
             } else if(token_equal(command, "else", TKN_ID)) { 
                 TODO("Implement #else");
             } else if(token_equal(command, "endif", TKN_ID)) { 
-                // TODO("Implement #endif");
                 cur = command;
                 if(state->cond_block_level > 0) {
                     state->cond_block_level--;
+                    printf("COND BLOCK LEVEL DOWN: %lu\n", state->cond_block_level);
                 } else {
-                    report_error(file->name, file->content, command->pos, "No conditional block related with this close.");
+                    report_error_token(command, file->content, "No conditional block related with this close.");
                 }
             } else if(token_equal(command, "undef", TKN_ID)) {
                 Token *name = command->next;
                 if(name->type != TKN_ID || !name->is_eol) {
-                    report_msg(file->name, file->content, name->next->pos, "extra tokens at end of #undef directive");
+                    report_token(name->next, file->content, "extra tokens at end of #undef directive");
                 }
                 
-                int pos = search_definition(state, name);
+                int pos = macro_search(state, name);
                 if(pos != -1) {
                     AC_ARRAY_REMOVE(state->macros, pos);
                 // } else {
@@ -558,17 +1054,24 @@ preprocess(Token *tok, File *file, State *state)
             } else if(token_equal(command, "line", TKN_ID)) {
                 TODO("Implement #line");
             } else if(token_equal(command, "error", TKN_ID)) {
-                TODO("Implement #error");
+                report_error_token(command, file->content, "Preprocessor error.");
             } else {
-                report_error(file->name, file->content, command->pos, "Unknown preprocessor command.");
+                report_error_token(command, file->content, "Unknown preprocessor command.");
             }
         } else {
-            // TODO! Check if the token is a macro and replace it!
-
+            int pos = macro_search(state, cur);
+            if(pos != -1) {
+                Token *macro = state->macros.items[pos];
+                Token *expanded = macro_expand(macro, cur, file->content);
+                if(expanded == NULL) {
+                    report_error_token(cur, file->content, "Unable to expand macro.");
+                } 
+                cur = expanded;
+                continue;
+            }
             ccur->next = token_copy(cur);
             ccur = ccur->next;
         }
-
         cur = cur->next;
     }
     return copy.next;
@@ -576,6 +1079,12 @@ preprocess(Token *tok, File *file, State *state)
 
 int main(int argc, const char **argv)
 {
+
+#ifdef EXECUTE_UNIT_TEST
+    run_tests();
+#endif
+
+
     if (argc < 2)
     {
         LOG_ERROR("Invalid number of parameters: %lu", argc);
@@ -583,12 +1092,12 @@ int main(int argc, const char **argv)
     }
 
     Args args = parse_args(argc, argv);
-    for (size_t i = 0; i < args.list.count; ++i)
+    for (size_t i = 0;i < args.file_list.count;++i)
     {
-        LOG_INFO("Param %lu) %s", i, args.list.items[i]);
+        LOG_INFO("Param %lu) %s", i, args.file_list.items[i]);
 
         CharArray content = {0};
-        if(read_file_content(args.list.items[i], &content)) {
+        if(read_file_content(args.file_list.items[i], &content)) {
             return 1;
         }
 
@@ -596,29 +1105,38 @@ int main(int argc, const char **argv)
         
         // 0) Clean up code (windows CRLF, unicode symbols, escape sequences) [Optional]
         // 1) Tokenize (Create linked list of elements)
-        File file = { .name = args.list.items[i], .content = content.items, .content_size = content.count, .full_path = NULL};
+        File file = { .name = args.file_list.items[i], .content = content.items, .content_size = content.count, .full_path = NULL};
         Token *tok = tokenize(&file);
         if(tok == NULL) return 1;
-        // 2) Preprocess (Iterate over the tokens and manage the #<ident> items)
-        
-        State state = {0};
-        Token *out = preprocess(tok, &file, &state);
-        
-        // 3) Generate code (Iterate over the tokens and generate ASM code for each)
-
-        // DUMP 
         printf("[ TOKENS ]\n");
-        Token *it = out;
+        Token *it = tok;
         while(it != NULL) {
             printf("%.*s ", (int)it->len, it->pos);
             it = it->next;
         }
         printf("\n----\n");
-        printf("[ MACROS ]\n");
-        for(size_t i = 0; i < state.macros.count; ++i) {
-            Token *t = state.macros.items[i];
-            printf(" > %.*s\n", (int)t->len, t->pos);
+
+
+
+
+        // 2) Preprocess (Iterate over the tokens and manage the #<ident> items)
+        
+        State state = {0};
+        Token *out = preprocess(tok, &file, &state);
+        printf("[ TOKENS ]\n");
+        it = out;
+        while(it != NULL) {
+            printf("%.*s ", (int)it->len, it->pos);
+            it = it->next;
         }
+        printf("\n----\n");
+        // printf("[ MACROS ]\n");
+        // for(size_t i = 0;i < state.macros.count;++i) {
+        //     Token *t = state.macros.items[i];
+        //     printf(" > %.*s\n", (int)t->len, t->pos);
+        // }
+        
+        // 3) Generate code (Iterate over the tokens and generate ASM code for each)
 
         // TODO: Destroy tokens
 

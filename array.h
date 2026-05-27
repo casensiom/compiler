@@ -19,6 +19,8 @@
         .items = (TYPE *)malloc((CAPACITY) * sizeof(TYPE)), .count = 0, .capacity = (CAPACITY) \
     }
 
+// TODO: Implement resize
+
 #define AC_ARRAY_CLONE(TYPE, INSTANCE, DST)                                                                                 \
     do                                                                                                                      \
     {                                                                                                                       \
