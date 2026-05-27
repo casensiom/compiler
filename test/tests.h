@@ -4,9 +4,9 @@
 #include "../tokenizer.h"
 #include <stdio.h>
 
+#include "test_struct.h"
 #include "test_numbers.h"
 #include "test_strings.h"
-
 
 typedef Token *(*TokenizerFn)(const char *, TokenLoc, TokenizerError *);
 
@@ -17,12 +17,13 @@ test_method(UnitTestCase *cases, size_t count, TokenizerFn fn, const char *name)
 
     for(size_t i = 0; i < num_cases; ++i) {
         TokenizerError error = {0};
-        Token *t = fn(cases[i].value, (TokenLoc){0}, &error);
+        Token         *t     = fn(cases[i].value, (TokenLoc){0}, &error);
 
         int success = (cases[i].is_valid && t != NULL) || (!cases[i].is_valid && t == NULL);
         total_success += success;
 
-        if(success) continue; // hide success test results
+        if(success)
+            continue;    // hide success test results
 
         printf("%03lu | %-30s | expected=%d | token=%s | success=%d", i, cases[i].value, cases[i].is_valid, t ? "Y" : "N", success);
         if(error.message) {
