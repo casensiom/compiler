@@ -1047,36 +1047,28 @@ preprocess(Token *tok, File *file, State *state) {
                 if(token_equal(command, "if", TKN_ID)) {
                     Token *cond = command->next;
                     if(cond->type == TKN_NUMBER) {
-                        if(atoi(cond->pos) == 0) {
-                            skip_block = 1;
-                        }
+                        skip_block = (atoi(cond->pos) == 0);
                     } else if(cond->type == TKN_ID) {
                         int pos = macro_search(state, cond);
                         if(pos != -1) {
                             Token *def = state->macros.items[pos];
-                            if(!def->is_eol && def->next->type == TKN_NUMBER && atoi(def->next->pos) == 0) {
-                                skip_block = 1;
-                            }
+                            Token *n   = def->next;
+                            // The only valid option is being defined with a non zero number value
+                            skip_block = !(!def->is_eol && n && n->type == TKN_NUMBER && atoi(n->pos) != 0);
+                        } else {
+                            skip_block = 1;
                         }
                     }
                 } else {
-                    Token *def = command->next;
-                    int    pos = macro_search(state, def);
-                    if(token_equal(command, "ifdef", TKN_ID)) {
-                        skip_block = (pos == -1);
-                    } else {
-                        skip_block = (pos != -1);
-                    }
+                    skip_block = (macro_search(state, command->next) == -1) == token_equal(command, "ifdef", TKN_ID);
                 }
 
                 state->cond_block_level++;
-                printf("COND BLOCK LEVEL UP: %lu\n", state->cond_block_level);
                 if(skip_block) {
                     while(cur->type != TKN_EOF) {
                         cur = cur->next;
                         if(token_equal(cur, "#", TKN_PUNCTUATION) && token_equal(cur->next, "endif", TKN_ID)) {
                             state->cond_block_level--;
-                            printf("COND BLOCK LEVEL DOWN: %lu\n", state->cond_block_level);
                             cur = cur->next;
                             break;
                         }
@@ -1092,7 +1084,6 @@ preprocess(Token *tok, File *file, State *state) {
                 cur = command;
                 if(state->cond_block_level > 0) {
                     state->cond_block_level--;
-                    printf("COND BLOCK LEVEL DOWN: %lu\n", state->cond_block_level);
                 } else {
                     report_error_token(command, file->content, "No conditional block related with this close.");
                 }
