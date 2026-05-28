@@ -1,5 +1,8 @@
 #include "tokenizer.h"
 
+// #define MACRO_EXPAND_DEBUG
+// #define MACRO_DEFINE_DEBUG
+
 #define EXECUTE_UNIT_TEST
 #include "test/tests.h"
 
@@ -8,6 +11,8 @@
 #include <sys/errno.h>
 #include <stdarg.h>
 #include <string.h>
+
+Token *file_tokenize(const char *filename, State *state);
 
 #define TRACE_ERROR(level, fmt, ...)                                \
     do {                                                            \
@@ -111,9 +116,12 @@ parse_args(int argc, const char **argv) {
 
 static char *
 copy_string(const char *str, size_t len) {
-    char *ret = malloc((len + 1) * sizeof(char *));
-    memcpy(ret, str, len);
-    ret[len] = '\0';
+    char *ret = NULL;
+    if(len > 0) {
+        ret = malloc((len + 1) * sizeof(char *));
+        memcpy(ret, str, len);
+        ret[len] = '\0';
+    }
     return ret;
 }
 
@@ -135,7 +143,7 @@ token_new(TokenKind type, const char *start, const char *end, TokenLoc location)
 
 static void
 token_full_dump(Token *t) {
-    printf(" > FULL DUMP (%p): ", t->pos);
+    printf(" > (%p): ", t->pos);
     while(t && t->type != TKN_EOF) {
         printf(" %.*s", (int)t->len, t->pos);
         t = t->next;
@@ -680,17 +688,6 @@ tokenize(File *file) {
     return head.next;
 }
 
-static Token *
-file_tokenize(const char *filename) {
-    CharArray content = {0};
-    if(read_file_content(filename, &content)) {
-        return NULL;
-    }
-
-    File file = {.name = filename, .content = content.items, .content_size = content.count, .full_path = NULL};
-    return tokenize(&file);
-}
-
 int
 macro_search(State *state, Token *def) {
     int pos = -1;
@@ -728,6 +725,7 @@ macro_param_search_by_name(MacroArgArray *args, const char *val, TokenKind type)
     return macro_param_search(args, &tok);
 }
 
+#ifdef MACRO_EXPAND_DEBUG
 static void
 macro_param_dump(MacroArgArray *args) {
     for(size_t i = 0; i < args->count; i++) {
@@ -743,70 +741,10 @@ macro_param_dump(MacroArgArray *args) {
         }
     }
 }
+#endif
 
 MacroArgArray
 macro_param_collect(Token **macro, Token **tok, const char *content) {
-    MacroArgArray args = {0};
-    Token        *it   = *tok;
-    Token        *it2  = *macro;
-
-    if(!token_equal(it, "(", TKN_PUNCTUATION) || !token_equal(it2, "(", TKN_PUNCTUATION)) {
-        report_error_token(it2, content, "Function-like macro requires parameters.");
-    }
-
-    while(!token_equal(it, ")", TKN_PUNCTUATION) && !token_equal(it2, ")", TKN_PUNCTUATION)) {
-        it  = it->next;
-        it2 = it2->next;
-        if(!it || it->type == TKN_EOF || !it2 || it2->type == TKN_EOF) {
-            report_error_token(it, content, "Unexpected error parsing macro parameters.");
-        }
-
-        printf("Collecting macro parameters!\n");
-        Token  param_macro;
-        Token *copy_macro = &param_macro;
-        while(!token_equal(it2, ",", TKN_PUNCTUATION) && !token_equal(it2, ")", TKN_PUNCTUATION)) {
-            printf("  '%.*s'\n", (int)it2->len, it2->pos);
-            copy_macro->next = token_copy(it2);
-            copy_macro       = copy_macro->next;
-            it2              = it2->next;
-        }
-        int force_rest = 0;
-        if(token_equal(copy_macro, "...", TKN_PUNCTUATION)) {
-            force_rest = 1;
-        }
-        // TODO: Check if macro still has params left and report error!
-
-        printf("Collecting code parameters!\n");
-        Token  param_code;
-        Token *copy_code = &param_code;
-        while((force_rest == 0 && !token_equal(it, ",", TKN_PUNCTUATION) && !token_equal(it, ")", TKN_PUNCTUATION)) ||
-              (force_rest == 1 && !token_equal(it, ")", TKN_PUNCTUATION))) {
-            printf("  '%.*s'\n", (int)it->len, it->pos);
-            copy_code->next = token_copy(it);
-            copy_code       = copy_code->next;
-            it              = it->next;
-        }
-
-        // This may not be an error if next macro param is "..."
-        if(!token_equals(it, it2) && !token_equal(it2->next, "...", TKN_PUNCTUATION)) {
-            report_error_token(it, content, "Macro parameters doesn't match definition.");
-        }
-
-        MacroArg arg = {.macro = param_macro.next, .code = param_code.next};
-        AC_ARRAY_PUSH(args, arg);
-    }
-
-    if((!token_equal(it, ")", TKN_PUNCTUATION) || !token_equal(it2, ")", TKN_PUNCTUATION))) {
-        report_error_token(it, content, "Macro parameters doesn't match definition.");
-    }
-
-    *tok   = it->next;
-    *macro = it2->next;
-    return args;
-}
-
-MacroArgArray
-macro_param_collect2(Token **macro, Token **tok, const char *content) {
     MacroArgArray args = {0};
     Token        *it;
 
@@ -845,7 +783,6 @@ macro_param_collect2(Token **macro, Token **tok, const char *content) {
             it              = it->next;
         }
         args.items[i].code = param_code.next;
-        token_full_dump(param_code.next);
 
         if(!token_equal(it, ")", TKN_PUNCTUATION)) {
             it = it->next;
@@ -859,7 +796,7 @@ macro_param_collect2(Token **macro, Token **tok, const char *content) {
 static Token *
 macro_expand(Token *macro, Token *tok, const char *content) {
     static size_t counter = 0;
-    UNUSED(content);
+
     if(macro->has_spaces) {
         // object-like
         return token_merge(macro->next, tok->next);
@@ -872,20 +809,18 @@ macro_expand(Token *macro, Token *tok, const char *content) {
         Token *m = macro->next;
         Token *c = tok->next;
 
-        MacroArgArray args = macro_param_collect2(&m, &c, content);
+        MacroArgArray args = macro_param_collect(&m, &c, content);
 
+#ifdef MACRO_EXPAND_DEBUG
         printf("\n\nFULL MACRO");
         token_full_dump(m);
         macro_param_dump(&args);
         printf("\n");
+#endif
 
         Token  copy;
         Token *cur = &copy;
         while(m && m->type != TKN_EOF) {
-            if(token_equal(m, "##", TKN_PUNCTUATION)) {
-                m = m->next;
-                continue;
-            }
             if(token_equal(m, ",", TKN_PUNCTUATION) && token_equal(m->next, "##", TKN_PUNCTUATION) &&
                token_equal(m->next->next, "__VA_ARGS__", TKN_ID)) {
                 Token *replacement = macro_param_search_by_name(&args, "...", TKN_PUNCTUATION);
@@ -895,27 +830,73 @@ macro_expand(Token *macro, Token *tok, const char *content) {
                     continue;
                 }
             }
+            if(token_equal(m, "##", TKN_PUNCTUATION) && token_equal(m->next, "__VA_ARGS__", TKN_ID)) {
+                m = m->next;
+                continue;
+            }
             Token *replacement = macro_param_search(&args, m);
             if(replacement != NULL) {
+#ifdef MACRO_EXPAND_DEBUG
                 printf(" - REPLACE TOKEN '%.*s'", (int)m->len, m->pos);
                 token_full_dump(replacement);
+#endif
                 cur->next = token_merge(replacement, NULL);
             } else {
+#ifdef MACRO_EXPAND_DEBUG
                 printf(" - COPY TOKEN '%.*s'", (int)m->len, m->pos);
+#endif
                 cur->next = token_copy(m);
             }
             m = m->next;
             while(cur->next != NULL) {
                 cur = cur->next;
             }
+#ifdef MACRO_EXPAND_DEBUG
             token_full_dump(copy.next);
+#endif
         }
         cur->next = c;
+#ifdef MACRO_EXPAND_DEBUG
         token_full_dump(copy.next);
         printf("\n");
+#endif
         return copy.next;
     }
     return NULL;
+}
+
+static char *
+file_exists(const char *path, const char *name) {
+    size_t path_len = 0;
+    size_t name_len = 0;
+    if(path != NULL) {
+        path_len = strlen(path);
+    }
+    if(name != NULL) {
+        name_len = strlen(name);
+    }
+
+    if((path_len + name_len) == 0) {
+        return NULL;
+    }
+
+    size_t size = path_len + name_len + 2;
+    size_t len  = 0;
+    char  *ptr  = (char *)malloc(size);
+    for(size_t i = 0; i < path_len; ++i) {
+        ptr[len++] = path[i];
+    }
+    if(path_len > 0) {
+        ptr[len++] = '/';
+    }
+    for(size_t i = 0; i < name_len; ++i) {
+        ptr[len++] = name[i];
+    }
+    ptr[len++] = '\0';
+
+    // TODO: Try to open the file, if success return the string, return NULL otherwise
+
+    return ptr;
 }
 
 Token *
@@ -932,14 +913,16 @@ preprocess(Token *tok, File *file, State *state) {
     Token *ccur = &copy;
 
     while(cur && cur->type != TKN_EOF) {
-        // token_dump(cur);
+        // printf(" -> %.*s %.*s\n", (int)cur->len, cur->pos, (int)cur->next->len, cur->next->pos);
         if(token_equal(cur, "#", TKN_PUNCTUATION)) {
             Token *command = cur->next;
-            // token_dump(command);
 
             if(token_equal(command, "include", TKN_ID)) {
-                Token      *last             = NULL;
-                Token      *open             = command->next;
+                Token *open = command->next;
+                if(open->pos[0] != '\"' && open->pos[0] != '<') {
+                    report_error_token(open, file->content, "Unrecognized include file delimiter.");
+                }
+
                 size_t      include_path_len = 0;
                 const char *include_path     = open->pos;
                 Token      *it               = open;
@@ -948,56 +931,86 @@ preprocess(Token *tok, File *file, State *state) {
                     it = it->next;
                 }
                 include_path_len += it->len;
-                last = it;
+                Token *last = it;
 
                 printf("-> INCLUDE %.*s\n", (int)include_path_len, include_path);
-                cur = last;
 
                 int pos;
                 AC_ARRAY_FIND(state->included, include_path, pos);
                 if(pos != -1) {
                     printf("-> SKIP INCLUDE %.*s\n", (int)include_path_len, include_path);
+                    cur = last->next;
+                    continue;
                 } else {
                     // TODO: Adjust line count reference
-                    char  *filename       = copy_string(include_path + 1, include_path_len - 2);
-                    Token *include_tokens = file_tokenize(filename);
+                    char *filename = copy_string(include_path + 1, include_path_len - 2);
+                    if(filename == NULL) {
+                        report_error_token(open, file->content, "empty filename.");
+                    }
+
+                    // Search paths for the current file
+                    char *found_path = NULL;
+                    if(include_path[0] == '\"') {
+                        found_path = file_exists(file->full_path, filename);
+                    }
+                    if(include_path[0] == '<' || found_path == NULL) {
+                        for(size_t i = 0; i < state->include_dirs.count && found_path == NULL; i++) {
+                            found_path = file_exists(state->include_dirs.items[i], filename);
+                        }
+                    }
+                    if(found_path == NULL) {
+                        // report_error_token(open, file->content, "file not found.");
+                        LOG_ERROR("file not found.");
+                        cur = last->next;
+                        continue;
+                    }
+
+                    Token *include_tokens = file_tokenize(found_path, state);
+                    free(found_path);
                     if(include_tokens != NULL) {
                         Token *it = include_tokens;
                         while(it->next != NULL && it->next->type != TKN_EOF) {
                             it = it->next;
                         }
+
                         // TODO: remove EOF token
-                        it->next = last->next;
-                        cur      = include_tokens;
+                        // token_delete(it->next);
+
+                        it->next   = last->next;
+                        last->next = include_tokens;
+                        cur        = include_tokens;
                         continue;
                     } else {
-                        LOG_ERROR("Unable to parse include file: %.*s", (int)include_path_len, include_path);
+                        LOG_WARN("No tokens found on: %.*s", (int)include_path_len, include_path);
+                        cur = last->next;
+                        continue;
                     }
                 }
 
             } else if(token_equal(command, "define", TKN_ID)) {
-                // TODO: Copy all macro token elements
-                Token *name = command->next;
-                if(name->type != TKN_ID) {
-                    report_error_token(name, file->content, "Expected a MARO identifier.");
+                if(command->next == NULL || command->next->type != TKN_ID) {
+                    report_error_token(command->next, file->content, "Expected a MACRO identifier.");
                 }
 
-                Token *it = cur;
-                printf("-> DEFINED:");
+                Token  macro_copy = {0};
+                Token *macro      = &macro_copy;
+                Token *it         = command->next;
                 while(it->is_eol == 0) {
-                    printf(" %.*s", (int)it->len, it->pos);
-                    it = it->next;
+                    macro->next = token_copy(it);
+                    macro       = macro->next;
+                    it          = it->next;
                 }
-                printf(" %.*s", (int)it->len, it->pos);
-                printf("\n");
-                token_full_dump(cur);
+                macro->next = token_copy(it);
+                macro       = macro->next;
+                cur         = it->next;
 
-                cur               = it->next;
-                TokenLoc location = {.filename = file->name, .line = -1, .column = -1};
-                it->next          = token_new(TKN_EOF, NULL, NULL, location);
+                macro->next = token_new(TKN_EOF, NULL, NULL, macro->location);
+                AC_ARRAY_PUSH(state->macros, macro_copy.next);
 
-                // TODO: Check if already exists and warn if needed
-                AC_ARRAY_PUSH(state->macros, name);
+                printf("-> DEFINED");
+                token_full_dump(macro_copy.next);
+#ifdef MACRO_DEFINE_DEBUG
+#endif
                 continue;
             } else if(token_equal(command, "if", TKN_ID) || token_equal(command, "ifdef", TKN_ID) ||
                       token_equal(command, "ifndef", TKN_ID)) {
@@ -1035,6 +1048,7 @@ preprocess(Token *tok, File *file, State *state) {
                         cur = cur->next;
                         if(token_equal(cur, "#", TKN_PUNCTUATION) && token_equal(cur->next, "endif", TKN_ID)) {
                             state->cond_block_level--;
+                            printf("COND BLOCK LEVEL DOWN: %lu\n", state->cond_block_level);
                             cur = cur->next;
                             break;
                         }
@@ -1095,6 +1109,18 @@ preprocess(Token *tok, File *file, State *state) {
     return copy.next;
 }
 
+Token *
+file_tokenize(const char *filename, State *state) {
+    CharArray content = {0};
+    if(read_file_content(filename, &content)) {
+        return NULL;
+    }
+
+    File   file = {.name = filename, .content = content.items, .content_size = content.count, .full_path = NULL};
+    Token *tok  = tokenize(&file);
+    return preprocess(tok, &file, state);
+}
+
 int
 main(int argc, const char **argv) {
 #ifdef EXECUTE_UNIT_TEST
@@ -1125,11 +1151,6 @@ main(int argc, const char **argv) {
             return 1;
         printf("[ TOKENS ]\n");
         token_full_dump(tok);
-        // Token *it = tok;
-        // while(it != NULL) {
-        //     printf("%.*s ", (int)it->len, it->pos);
-        //     it = it->next;
-        // }
         printf("\n----\n");
 
         // 2) Preprocess (Iterate over the tokens and manage the #<ident> items)
@@ -1138,11 +1159,6 @@ main(int argc, const char **argv) {
         Token *out   = preprocess(tok, &file, &state);
         printf("[ TOKENS ]\n");
         token_full_dump(out);
-        // it = out;
-        // while(it != NULL) {
-        //     printf("%.*s ", (int)it->len, it->pos);
-        //     it = it->next;
-        // }
         printf("\n----\n");
         // printf("[ MACROS ]\n");
         // for(size_t i = 0;i < state.macros.count;++i) {
