@@ -12,6 +12,8 @@
 #include <stdarg.h>
 #include <string.h>
 
+TokenPtrArray gAllTokens;
+
 Token *file_tokenize(const char *filename, State *state);
 
 #define TRACE_ERROR(level, fmt, ...)                                \
@@ -138,12 +140,31 @@ token_new(TokenKind type, const char *start, const char *end, TokenLoc location)
 
     tok->next = NULL;
 
+    AC_ARRAY_PUSH(gAllTokens, tok);
+
     return tok;
 }
 
 static void
+token_delete(Token *tok) {
+    while(tok != NULL) {
+        size_t pos = -1;
+        AC_ARRAY_FIND(gAllTokens, tok, pos);
+        if(pos != (size_t)-1) {
+            gAllTokens.items[pos] = NULL;
+        }
+        Token *next = tok->next;
+        tok->pos    = NULL;
+        tok->len    = 0;
+        tok->type   = TKN_UNKNOWN;
+        free(tok);
+        tok = next;
+    }
+}
+
+static void
 token_full_dump(Token *t) {
-    printf(" > (%p): ", t->pos);
+    printf(" > (%p): ", t);
     while(t && t->type != TKN_EOF) {
         printf(" %.*s", (int)t->len, t->pos);
         t = t->next;
@@ -834,6 +855,11 @@ macro_expand(Token *macro, Token *tok, const char *content) {
                 m = m->next;
                 continue;
             }
+            if(m->type == TKN_ID && token_equal(m->next, "##", TKN_PUNCTUATION) && m->next->next->type == TKN_ID) {
+                // TODO: Merge all tree tokens in one
+                LOG_INFO("Add support to merge identifiers ('%.*s' '%.*s' '%.*s')\n", (int)m->len, m->pos, (int)m->next->len, m->next->pos,
+                         (int)m->next->next->len, m->next->next->pos);
+            }
             Token *replacement = macro_param_search(&args, m);
             if(replacement != NULL) {
 #ifdef MACRO_EXPAND_DEBUG
@@ -841,6 +867,9 @@ macro_expand(Token *macro, Token *tok, const char *content) {
                 token_full_dump(replacement);
 #endif
                 cur->next = token_merge(replacement, NULL);
+                if(replacement->type == TKN_EOF) {
+                    token_delete(replacement);
+                }
             } else {
 #ifdef MACRO_EXPAND_DEBUG
                 printf(" - COPY TOKEN '%.*s'", (int)m->len, m->pos);
@@ -903,7 +932,6 @@ Token *
 preprocess(Token *tok, File *file, State *state) {
     /**
      * [ ] folder support on includes
-     * [x] remove extra comma on empty variatic args
      * [ ] avoid replace self references in macros
      */
 
@@ -1118,7 +1146,12 @@ file_tokenize(const char *filename, State *state) {
 
     File   file = {.name = filename, .content = content.items, .content_size = content.count, .full_path = NULL};
     Token *tok  = tokenize(&file);
-    return preprocess(tok, &file, state);
+
+    Token *ret = preprocess(tok, &file, state);
+
+    token_delete(tok);
+
+    return ret;
 }
 
 int
@@ -1160,15 +1193,28 @@ main(int argc, const char **argv) {
         printf("[ TOKENS ]\n");
         token_full_dump(out);
         printf("\n----\n");
-        // printf("[ MACROS ]\n");
-        // for(size_t i = 0;i < state.macros.count;++i) {
-        //     Token *t = state.macros.items[i];
-        //     printf(" > %.*s\n", (int)t->len, t->pos);
-        // }
 
         // 3) Generate code (Iterate over the tokens and generate ASM code for each)
 
-        // TODO: Destroy tokens
+        // 4) Destroy tokens
+        token_delete(tok);
+        token_delete(out);
+
+        for(size_t m = 0; m < state.macros.count; m++) {
+            Token *tmp = state.macros.items[m];
+            token_delete(tmp);
+        }
+        state.macros.count = 0;
+
+        size_t zombies = 0;
+        for(size_t i = 0; i < gAllTokens.count; i++) {
+            Token *tmp = gAllTokens.items[i];
+            if(tmp != NULL) {
+                zombies++;
+                LOG_WARN("ZOMBIE: %lu (%p) -> '%.*s' type: %d (pos: %p) [index: %lu]\n", zombies, tmp, (int)tmp->len, tmp->pos,
+                         (int)tmp->type, tmp->pos, i);
+            }
+        }
 
         AC_ARRAY_DESTROY(content);
     }

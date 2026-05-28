@@ -22,10 +22,13 @@ test_method(UnitTestCase *cases, size_t count, TokenizerFn fn, const char *name)
         int success = (cases[i].is_valid && t != NULL) || (!cases[i].is_valid && t == NULL);
         total_success += success;
 
+        const char *token_present = t ? "Y" : "N";
+        token_delete(t);
+
         if(success)
             continue;    // hide success test results
 
-        printf("%03lu | %-30s | expected=%d | token=%s | success=%d", i, cases[i].value, cases[i].is_valid, t ? "Y" : "N", success);
+        printf("%03lu | %-30s | expected=%d | token=%s | success=%d", i, cases[i].value, cases[i].is_valid, token_present, success);
         if(error.message) {
             printf(" | error=%s", error.message);
         } else if(t != NULL) {

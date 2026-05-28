@@ -16,7 +16,7 @@ typedef struct Args {
     ConstCharPtrArray file_list;
 } Args;
 
-typedef enum TokenKind { TKN_START, TKN_ID, TKN_KEYWORD, TKN_NUMBER, TKN_STRING, TKN_PUNCTUATION, TKN_EOF } TokenKind;
+typedef enum TokenKind { TKN_UNKNOWN, TKN_START, TKN_ID, TKN_KEYWORD, TKN_NUMBER, TKN_STRING, TKN_PUNCTUATION, TKN_EOF } TokenKind;
 
 typedef struct TokenLoc {
     size_t      line;
@@ -77,5 +77,6 @@ typedef struct TokenizerError {
 static Token *tokenize_literal(const char *pos, TokenLoc token_loc, TokenizerError *error);
 static Token *tokenize_string(const char *pos, TokenLoc token_loc, TokenizerError *error);
 static Token *tokenize_number(const char *pos, TokenLoc token_loc, TokenizerError *error);
+static void   token_delete(Token *tok);
 
 #endif
