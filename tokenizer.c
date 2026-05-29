@@ -15,7 +15,7 @@
 
 TokenPtrArray gAllTokens;
 
-Token *file_tokenize(const char *filename, State *state);
+Token *tokenize_file(const char *filename, State *state);
 
 #define TRACE_ERROR(level, fmt, ...)                                \
     do {                                                            \
@@ -551,13 +551,17 @@ tokenize_string(const char *pos, TokenLoc token_loc, TokenizerError *error) {
                 error->message = "Break line inside string.";
                 break;
             }
+            if(p[0] == '\\' && p[1] == '\n') {
+                p += 2;
+                continue;
+            }
             if(*p == '\\') {
                 size_t len = read_escape_sequence(p);
                 if(len > 0) {
                     p += len - 1;
                 } else {
                     error->pos     = p;
-                    error->message = "Invalid escape senquence.";
+                    error->message = string_format("Invalid escape senquence %d %d.", (int)p[0], (int)p[1]);
                     break;
                 }
             }
@@ -840,6 +844,31 @@ macro_param_collect(Token **macro, Token **tok, const char *content) {
 }
 
 static Token *
+macro_replace_object(State *state, Token *m, Token *tok) {
+    Token *ret = NULL;
+
+    if(strncmp(m->pos, "__FILE__", 8) == 0) {
+        char *buff = string_format("\"%s\"", tok->location.filename);
+        ret        = token_new_from_str(TKN_ID, buff, (TokenLoc){0});
+    } else if(strncmp(m->pos, "__LINE__", 8) == 0) {
+        char *buff = string_format("%d", tok->location.line + 1);
+        ret        = token_new_from_str(TKN_NUMBER, buff, (TokenLoc){0});
+    } else if(strncmp(m->pos, "__DATE__", 8) == 0) {
+        size_t len = strlen(state->date);
+        ret        = token_new(TKN_ID, state->date, state->date + len, (TokenLoc){0});
+    } else if(strncmp(m->pos, "__TIME__", 8) == 0) {
+        size_t len = strlen(state->time);
+        ret        = token_new(TKN_ID, state->time, state->time + len, (TokenLoc){0});
+    }
+
+    if(ret != NULL) {
+        ret->next = token_new(TKN_EOF, NULL, NULL, (TokenLoc){0});
+    }
+
+    return ret;
+}
+
+static Token *
 macro_expand(State *state, Token *macro, Token *tok, const char *content) {
     // static size_t counter = 0;
     // counter++;
@@ -917,30 +946,12 @@ macro_expand(State *state, Token *macro, Token *tok, const char *content) {
         return copy.next;
     } else {
         // object-like
-        Token *ret = NULL;
-        Token *m   = macro;
-        if(token_equal(m, "__FILE__", TKN_ID) || token_equal(m, "__LINE__", TKN_ID) || token_equal(m, "__DATE__", TKN_ID) ||
-           token_equal(m, "__TIME__", TKN_ID)) {
-            if(strncmp(m->pos, "__FILE__", 8) == 0) {
-                char *buff = string_format("\"%s\"", tok->location.filename);
-                ret        = token_new_from_str(TKN_ID, buff, (TokenLoc){0});
-            } else if(strncmp(m->pos, "__LINE__", 8) == 0) {
-                char *buff = string_format("%d", tok->location.line + 1);
-                ret        = token_new_from_str(TKN_NUMBER, buff, (TokenLoc){0});
-            } else if(strncmp(m->pos, "__DATE__", 8) == 0) {
-                size_t len = strlen(state->date);
-                ret        = token_new(TKN_ID, state->date, state->date + len, (TokenLoc){0});
-            } else if(strncmp(m->pos, "__TIME__", 8) == 0) {
-                size_t len = strlen(state->time);
-                ret        = token_new(TKN_ID, state->time, state->time + len, (TokenLoc){0});
-            }
-            ret->next = token_new(TKN_EOF, NULL, NULL, (TokenLoc){0});
-
-            Token *out = token_merge(ret, tok->next);
+        Token *ret = macro_replace_object(state, macro, tok);
+        if(ret != NULL) {
+            Token *back = token_merge(ret, tok->next);
             token_delete(ret);
-            return out;
+            return back;
         }
-
         return token_merge(macro->next, tok->next);
     }
     return NULL;
@@ -1046,7 +1057,7 @@ preprocess(Token *tok, File *file, State *state) {
                         continue;
                     }
 
-                    Token *include_tokens = file_tokenize(found_path, state);
+                    Token *include_tokens = tokenize_file(found_path, state);
                     free(found_path);
                     if(include_tokens != NULL) {
                         Token *it = include_tokens;
@@ -1228,25 +1239,22 @@ preprocess(Token *tok, File *file, State *state) {
 }
 
 Token *
-file_tokenize_file(File *file, State *state) {
+tokenize_file_content(File *file, State *state) {
     Token *tok = tokenize(file);
-
     Token *ret = preprocess(tok, file, state);
-
     token_delete(tok);
-
     return ret;
 }
 
 Token *
-file_tokenize(const char *filename, State *state) {
+tokenize_file(const char *filename, State *state) {
     CharArray content = {0};
     if(read_file_content(filename, &content)) {
         return NULL;
     }
 
     File file = {.name = filename, .content = content.items, .content_size = content.count, .full_path = NULL};
-    return file_tokenize_file(&file, state);
+    return tokenize_file_content(&file, state);
 }
 
 void
@@ -1269,7 +1277,7 @@ init_state(State *state) {
     size_t len = strlen(macro_names);
 
     File   file   = {.name = "system", .content = macro_names, .content_size = len, .full_path = NULL};
-    Token *tokens = file_tokenize_file(&file, state);
+    Token *tokens = tokenize_file_content(&file, state);
     token_delete(tokens);
 }
 
