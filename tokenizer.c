@@ -315,7 +315,7 @@ report_token(Token *tok, const char *start, const char *msg) {
     for(size_t i = 0; i < column; i++) {
         printf(" ");
     }
-    printf("^ %s\n", msg);
+    printf("^\n");
 }
 
 static void
@@ -352,7 +352,7 @@ report_msg(const char *filename, const char *start, const char *pos, const char 
     for(size_t i = 0; i < column; i++) {
         printf(" ");
     }
-    printf("^ %s\n", msg);
+    printf("^\n");
 }
 
 static void
@@ -940,11 +940,12 @@ preprocess(Token *tok, File *file, State *state) {
     Token  copy = {};
     Token *ccur = &copy;
 
+    int ignore_and_skip = 0;
+    int else_visited    = 0;
     while(cur && cur->type != TKN_EOF) {
         // printf(" -> %.*s %.*s\n", (int)cur->len, cur->pos, (int)cur->next->len, cur->next->pos);
         if(token_equal(cur, "#", TKN_PUNCTUATION)) {
             Token *command = cur->next;
-
             if(token_equal(command, "include", TKN_ID)) {
                 Token *open = command->next;
                 if(open->pos[0] != '\"' && open->pos[0] != '<') {
@@ -1001,9 +1002,6 @@ preprocess(Token *tok, File *file, State *state) {
                             it = it->next;
                         }
 
-                        // TODO: remove EOF token
-                        // token_delete(it->next);
-
                         it->next   = last->next;
                         last->next = include_tokens;
                         cur        = include_tokens;
@@ -1035,16 +1033,27 @@ preprocess(Token *tok, File *file, State *state) {
                 macro->next = token_new(TKN_EOF, NULL, NULL, macro->location);
                 AC_ARRAY_PUSH(state->macros, macro_copy.next);
 
+#ifdef MACRO_DEFINE_DEBUG
                 printf("-> DEFINED");
                 token_full_dump(macro_copy.next);
-#ifdef MACRO_DEFINE_DEBUG
 #endif
                 continue;
             } else if(token_equal(command, "if", TKN_ID) || token_equal(command, "ifdef", TKN_ID) ||
-                      token_equal(command, "ifndef", TKN_ID)) {
+                      token_equal(command, "ifndef", TKN_ID) || token_equal(command, "elif", TKN_ID)) {
                 int skip_block = 0;
 
-                if(token_equal(command, "if", TKN_ID)) {
+                if(token_equal(command, "ifdef", TKN_ID) || token_equal(command, "ifndef", TKN_ID)) {
+                    if(command->is_eol) {
+                        report_error_token(command, file->content, "macro name missing");
+                    }
+                    skip_block = (macro_search(state, command->next) == -1) == token_equal(command, "ifdef", TKN_ID);
+                } else if(token_equal(command, "if", TKN_ID) || token_equal(command, "elif", TKN_ID)) {
+                    if(token_equal(command, "elif", TKN_ID) && state->cond_block_level == 0) {
+                        report_error_token(command, file->content, "#elif without #if");
+                    }
+                    if(command->is_eol) {
+                        report_error_token(command, file->content, "expected value in expression");
+                    }
                     Token *cond = command->next;
                     if(cond->type == TKN_NUMBER) {
                         skip_block = (atoi(cond->pos) == 0);
@@ -1059,34 +1068,62 @@ preprocess(Token *tok, File *file, State *state) {
                             skip_block = 1;
                         }
                     }
-                } else {
-                    skip_block = (macro_search(state, command->next) == -1) == token_equal(command, "ifdef", TKN_ID);
                 }
 
-                state->cond_block_level++;
-                if(skip_block) {
-                    while(cur->type != TKN_EOF) {
+                if(strncmp(command->pos, "if", 2) == 0) {
+                    state->cond_block_level++;
+                    ignore_and_skip = 0;
+                    else_visited    = 0;
+                }
+
+                if(skip_block || ignore_and_skip) {
+                    Token *save = NULL;
+                    while(cur && cur->type != TKN_EOF) {
                         cur = cur->next;
-                        if(token_equal(cur, "#", TKN_PUNCTUATION) && token_equal(cur->next, "endif", TKN_ID)) {
-                            state->cond_block_level--;
-                            cur = cur->next;
+                        if(token_equal(cur, "#", TKN_PUNCTUATION)) {
+                            save = cur;
                             break;
                         }
                     }
+                    if(save != NULL) {
+                        cur = save;
+                        continue;
+                    }
                 } else {
-                    cur = command->next;
+                    cur             = command->next;
+                    ignore_and_skip = 1;
                 }
-            } else if(token_equal(command, "elif", TKN_ID)) {
-                TODO("Implement #elif");
             } else if(token_equal(command, "else", TKN_ID)) {
-                TODO("Implement #else");
-            } else if(token_equal(command, "endif", TKN_ID)) {
-                cur = command;
-                if(state->cond_block_level > 0) {
-                    state->cond_block_level--;
-                } else {
-                    report_error_token(command, file->content, "No conditional block related with this close.");
+                if(else_visited > 0) {
+                    report_error_token(command, file->content, "#else after #else");
                 }
+                else_visited = 1;
+                if(state->cond_block_level == 0) {
+                    report_error_token(command, file->content, "#endif without #if");
+                }
+                if(ignore_and_skip) {
+                    Token *save = NULL;
+                    while(cur && cur->type != TKN_EOF) {
+                        cur = cur->next;
+                        if(token_equal(cur, "#", TKN_PUNCTUATION)) {
+                            save = cur;
+                            break;
+                        }
+                    }
+                    if(save != NULL) {
+                        cur = save;
+                        continue;
+                    }
+                } else {
+                    cur = command;
+                }
+            } else if(token_equal(command, "endif", TKN_ID)) {
+                if(state->cond_block_level == 0) {
+                    report_error_token(command, file->content, "#endif without #if");
+                }
+                ignore_and_skip = 0;
+                state->cond_block_level--;
+                cur = command;
             } else if(token_equal(command, "undef", TKN_ID)) {
                 Token *name = command->next;
                 if(name->type != TKN_ID || !name->is_eol) {
@@ -1105,7 +1142,15 @@ preprocess(Token *tok, File *file, State *state) {
             } else if(token_equal(command, "line", TKN_ID)) {
                 TODO("Implement #line");
             } else if(token_equal(command, "error", TKN_ID)) {
-                report_error_token(command, file->content, "Preprocessor error.");
+                char buffer[256] = {};
+                if(!command->is_eol) {
+                    Token *message = command->next;
+                    size_t len     = message->len > 255 ? 255 : message->len;
+                    for(size_t i = 0; i < len; i++) {
+                        buffer[i] = message->pos[i];
+                    }
+                }
+                report_error_token(command, file->content, (const char *)buffer);
             } else {
                 report_error_token(command, file->content, "Unknown preprocessor command.");
             }
