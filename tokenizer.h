@@ -35,8 +35,7 @@ typedef struct Token {
 
     struct Token *next;
     // --
-    struct Token *from_macro;    // if expanded from object-like macro
-    char         *value;         // if composed macro ##
+    const char *str;    // allocated memory that should be released
 } Token;
 typedef Token *TokenPtr;
 AC_ARRAY_DEFINE(TokenPtr);
@@ -67,6 +66,8 @@ typedef struct State {
     CharPtrArray  include_dirs;
     // VariableArray vars;
     // MethodArray methods;
+    const char *date;
+    const char *time;
 } State;
 
 typedef struct TokenizerError {

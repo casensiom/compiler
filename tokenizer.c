@@ -11,6 +11,7 @@
 #include <sys/errno.h>
 #include <stdarg.h>
 #include <string.h>
+#include <time.h>
 
 TokenPtrArray gAllTokens;
 
@@ -31,6 +32,16 @@ Token *file_tokenize(const char *filename, State *state);
 #define LOG_INFO(fmt, ...)  log_msg(stdout, "[INFO]", fmt, ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...)  log_msg(stderr, "[WARN]", fmt, ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) log_msg(stderr, "[ERROR]", fmt, ##__VA_ARGS__)
+
+char *
+string_format(const char *fmt, ...) {
+    char   *ret = NULL;
+    va_list args;
+    va_start(args, fmt);
+    vasprintf(&ret, fmt, args);
+    va_end(args);
+    return ret;
+}
 
 void
 log_msg(FILE *out, const char *level, const char *fmt, ...) {
@@ -139,10 +150,20 @@ token_new(TokenKind type, const char *start, const char *end, TokenLoc location)
     tok->location = location;
 
     tok->next = NULL;
+    tok->str  = NULL;
 
     AC_ARRAY_PUSH(gAllTokens, tok);
 
     return tok;
+}
+
+static Token *
+token_new_from_str(TokenKind type, const char *start, TokenLoc location) {
+    size_t      len = strlen(start);
+    const char *end = start + len;
+    Token      *ret = token_new(type, start, end, location);
+    ret->str        = start;
+    return ret;
 }
 
 static void
@@ -157,6 +178,10 @@ token_delete(Token *tok) {
         tok->pos    = NULL;
         tok->len    = 0;
         tok->type   = TKN_UNKNOWN;
+        if(tok->str) {
+            free((void *)tok->str);
+        }
+        tok->str = NULL;
         free(tok);
         tok = next;
     }
@@ -164,7 +189,7 @@ token_delete(Token *tok) {
 
 static void
 token_full_dump(Token *t) {
-    printf(" > (%p): ", t);
+    printf(" > ");
     while(t && t->type != TKN_EOF) {
         printf(" %.*s", (int)t->len, t->pos);
         t = t->next;
@@ -180,6 +205,7 @@ token_copy(Token *src) {
     Token *tok = calloc(1, sizeof(Token));
     *tok       = *src;
     tok->next  = NULL;
+    src->str   = NULL;    // last copy keeps str ownership
     return tok;
 }
 
@@ -222,6 +248,9 @@ token_merge(Token *t1, Token *t2) {
         cur->next = token_copy(t1);
         t1        = t1->next;
         cur       = cur->next;
+        if(t2) {
+            cur->location = t2->location;
+        }
     }
     cur->next = t2;
 
@@ -705,7 +734,8 @@ tokenize(File *file) {
         printf("Unexpected token '%c' -> %d | 0x%X\n", *p, (int)*p, (int)*p);
         report_error(file->name, file->content, p, "Unexpected token.");
     }
-    cur->next = token_new(TKN_EOF, p, p, token_loc);
+    cur->is_eol = 1;
+    cur->next   = token_new(TKN_EOF, p, p, token_loc);
     return head.next;
 }
 
@@ -739,11 +769,6 @@ macro_param_search(MacroArgArray *args, Token *tok) {
         }
     }
     return ret;
-}
-static Token *
-macro_param_search_by_name(MacroArgArray *args, const char *val, TokenKind type) {
-    Token tok = {.type = type, .pos = val, .len = strlen(val)};
-    return macro_param_search(args, &tok);
 }
 
 #ifdef MACRO_EXPAND_DEBUG
@@ -815,18 +840,15 @@ macro_param_collect(Token **macro, Token **tok, const char *content) {
 }
 
 static Token *
-macro_expand(Token *macro, Token *tok, const char *content) {
-    static size_t counter = 0;
+macro_expand(State *state, Token *macro, Token *tok, const char *content) {
+    // static size_t counter = 0;
+    // counter++;
+    // if(counter > 100) {
+    //     report_error_token(tok, content, "Macro expand too many times, check for a loop.");
+    // }
 
-    if(macro->has_spaces) {
-        // object-like
-        return token_merge(macro->next, tok->next);
-    } else if(token_equal(macro->next, "(", TKN_PUNCTUATION)) {
+    if(macro->has_spaces == 0 && token_equal(macro->next, "(", TKN_PUNCTUATION)) {
         // function-like
-        counter++;
-        if(counter > 100) {
-            report_error_token(tok, content, "Macro expand too many times, check for a loop.");
-        }
         Token *m = macro->next;
         Token *c = tok->next;
 
@@ -844,7 +866,8 @@ macro_expand(Token *macro, Token *tok, const char *content) {
         while(m && m->type != TKN_EOF) {
             if(token_equal(m, ",", TKN_PUNCTUATION) && token_equal(m->next, "##", TKN_PUNCTUATION) &&
                token_equal(m->next->next, "__VA_ARGS__", TKN_ID)) {
-                Token *replacement = macro_param_search_by_name(&args, "...", TKN_PUNCTUATION);
+                Token  dots        = {.type = TKN_PUNCTUATION, .pos = "...", .len = 3, .next = NULL};
+                Token *replacement = macro_param_search(&args, &dots);
 
                 if(replacement == NULL) {
                     m = m->next->next;
@@ -866,7 +889,8 @@ macro_expand(Token *macro, Token *tok, const char *content) {
                 printf(" - REPLACE TOKEN '%.*s'", (int)m->len, m->pos);
                 token_full_dump(replacement);
 #endif
-                cur->next = token_merge(replacement, NULL);
+                replacement->location = tok->location;
+                cur->next             = token_merge(replacement, NULL);
                 if(replacement->type == TKN_EOF) {
                     token_delete(replacement);
                 }
@@ -874,7 +898,8 @@ macro_expand(Token *macro, Token *tok, const char *content) {
 #ifdef MACRO_EXPAND_DEBUG
                 printf(" - COPY TOKEN '%.*s'", (int)m->len, m->pos);
 #endif
-                cur->next = token_copy(m);
+                cur->next           = token_copy(m);
+                cur->next->location = tok->location;
             }
             m = m->next;
             while(cur->next != NULL) {
@@ -890,6 +915,33 @@ macro_expand(Token *macro, Token *tok, const char *content) {
         printf("\n");
 #endif
         return copy.next;
+    } else {
+        // object-like
+        Token *ret = NULL;
+        Token *m   = macro;
+        if(token_equal(m, "__FILE__", TKN_ID) || token_equal(m, "__LINE__", TKN_ID) || token_equal(m, "__DATE__", TKN_ID) ||
+           token_equal(m, "__TIME__", TKN_ID)) {
+            if(strncmp(m->pos, "__FILE__", 8) == 0) {
+                char *buff = string_format("\"%s\"", tok->location.filename);
+                ret        = token_new_from_str(TKN_ID, buff, (TokenLoc){0});
+            } else if(strncmp(m->pos, "__LINE__", 8) == 0) {
+                char *buff = string_format("%d", tok->location.line + 1);
+                ret        = token_new_from_str(TKN_NUMBER, buff, (TokenLoc){0});
+            } else if(strncmp(m->pos, "__DATE__", 8) == 0) {
+                size_t len = strlen(state->date);
+                ret        = token_new(TKN_ID, state->date, state->date + len, (TokenLoc){0});
+            } else if(strncmp(m->pos, "__TIME__", 8) == 0) {
+                size_t len = strlen(state->time);
+                ret        = token_new(TKN_ID, state->time, state->time + len, (TokenLoc){0});
+            }
+            ret->next = token_new(TKN_EOF, NULL, NULL, (TokenLoc){0});
+
+            Token *out = token_merge(ret, tok->next);
+            token_delete(ret);
+            return out;
+        }
+
+        return token_merge(macro->next, tok->next);
     }
     return NULL;
 }
@@ -1021,16 +1073,18 @@ preprocess(Token *tok, File *file, State *state) {
                 Token  macro_copy = {0};
                 Token *macro      = &macro_copy;
                 Token *it         = command->next;
-                while(it->is_eol == 0) {
-                    macro->next = token_copy(it);
-                    macro       = macro->next;
-                    it          = it->next;
+                while(it->next && it->is_eol == 0) {
+                    macro->next     = token_copy(it);
+                    macro           = macro->next;
+                    macro->location = (TokenLoc){0};
+                    it              = it->next;
                 }
-                macro->next = token_copy(it);
-                macro       = macro->next;
-                cur         = it->next;
+                macro->next     = token_copy(it);
+                macro           = macro->next;
+                macro->location = (TokenLoc){0};
+                cur             = it->next;
 
-                macro->next = token_new(TKN_EOF, NULL, NULL, macro->location);
+                macro->next = token_new(TKN_EOF, NULL, NULL, (TokenLoc){0});
                 AC_ARRAY_PUSH(state->macros, macro_copy.next);
 
 #ifdef MACRO_DEFINE_DEBUG
@@ -1158,7 +1212,7 @@ preprocess(Token *tok, File *file, State *state) {
             int pos = macro_search(state, cur);
             if(pos != -1) {
                 Token *macro    = state->macros.items[pos];
-                Token *expanded = macro_expand(macro, cur, file->content);
+                Token *expanded = macro_expand(state, macro, cur, file->content);
                 if(expanded == NULL) {
                     report_error_token(cur, file->content, "Unable to expand macro.");
                 }
@@ -1174,20 +1228,49 @@ preprocess(Token *tok, File *file, State *state) {
 }
 
 Token *
+file_tokenize_file(File *file, State *state) {
+    Token *tok = tokenize(file);
+
+    Token *ret = preprocess(tok, file, state);
+
+    token_delete(tok);
+
+    return ret;
+}
+
+Token *
 file_tokenize(const char *filename, State *state) {
     CharArray content = {0};
     if(read_file_content(filename, &content)) {
         return NULL;
     }
 
-    File   file = {.name = filename, .content = content.items, .content_size = content.count, .full_path = NULL};
-    Token *tok  = tokenize(&file);
+    File file = {.name = filename, .content = content.items, .content_size = content.count, .full_path = NULL};
+    return file_tokenize_file(&file, state);
+}
 
-    Token *ret = preprocess(tok, &file, state);
+void
+init_state(State *state) {
+    const char *macro_names = "\
+        #define __FILE__\n\
+        #define __LINE__\n\
+        #define __DATE__\n\
+        #define __TIME__\n\
+        #define __STDC__ 1\n\
+        #define __STDC_VERSION__ 199409L\n\
+        #define __STDC_HOSTED__ 1\n";
 
-    token_delete(tok);
+    time_t       now          = time(NULL);
+    struct tm   *tm           = localtime(&now);
+    static char *month_name[] = {"Jan", "Feb", "Mar", "Apr", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    state->date               = string_format("\"%s %02d %d\"", month_name[tm->tm_mon], tm->tm_mday, tm->tm_year + 1900);
+    state->time               = string_format("\"%02d:%02d:%02d\"", tm->tm_hour, tm->tm_min, tm->tm_sec);
 
-    return ret;
+    size_t len = strlen(macro_names);
+
+    File   file   = {.name = "system", .content = macro_names, .content_size = len, .full_path = NULL};
+    Token *tokens = file_tokenize_file(&file, state);
+    token_delete(tokens);
 }
 
 int
@@ -1224,8 +1307,9 @@ main(int argc, const char **argv) {
 
         // 2) Preprocess (Iterate over the tokens and manage the #<ident> items)
 
-        State  state = {0};
-        Token *out   = preprocess(tok, &file, &state);
+        State state = {0};
+        init_state(&state);
+        Token *out = preprocess(tok, &file, &state);
         printf("[ TOKENS ]\n");
         token_full_dump(out);
         printf("\n----\n");
@@ -1241,6 +1325,12 @@ main(int argc, const char **argv) {
             token_delete(tmp);
         }
         state.macros.count = 0;
+        if(state.date) {
+            free((void *)state.date);
+        }
+        if(state.time) {
+            free((void *)state.time);
+        }
 
         size_t zombies = 0;
         for(size_t i = 0; i < gAllTokens.count; i++) {
