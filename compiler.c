@@ -234,7 +234,36 @@ void token_delete(Token *tok) {
 }
 
 int token_equal(Token *tok, const char *str) {
-    return (tok && str && strncmp(tok->pos, str, tok->len) && str[tok->len] == '\0');
+#if 0
+    if (!tok) {
+        printf("Invalid token pointer.\n");
+    }
+    if (!str) {
+        printf("Invalid comparator label.\n");
+    }
+    int l1 = strlen(str);
+    int l2 = tok->len;
+    if (l1 != l2) {
+        printf("Token lenght doesn't match. [%d] vs [%d]\n", (int)l1, (int)l2);
+    }
+    if (strncmp(tok->pos, str, tok->len) != 0) {
+        printf("Token name doesn't match. [%s] vs [%.*s]\n", str, (int)tok->len, tok->pos);
+    }
+#endif
+    return (tok && str && (strlen(str) == tok->len) && (strncmp(tok->pos, str, tok->len) == 0));
+}
+
+static void
+token_dump_full(Token *t) {
+    printf(" > ");
+    while (t && t->type != TKN_EOF) {
+        printf(" %.*s", (int)t->len, t->pos);
+        t = t->next;
+    }
+    if (t == NULL) {
+        printf("$");
+    }
+    printf("\n");
 }
 
 // process_file_content
@@ -549,6 +578,8 @@ static Token *tokenize_punctuation(const char *pos, TokenLocation loc, Tokenizer
 }
 
 static Token *tokenize(State *state, File *file) {
+    UNUSED(state);
+
     Token head = {0};
     Token *cur = &head;
     TokenLocation loc = {0};
@@ -643,51 +674,102 @@ static Token *tokenize(State *state, File *file) {
     return head.next;
 }
 
-Token *manage_include(State *state, Token *tok) {
-    while (!tok->is_eol) {
+Token *manage_include(State *state, Token *command) {
+    UNUSED(state);
+    Token *tok = command->next;
+    while (tok && !tok->is_eol && !(tok->type == TKN_EOF)) {
         tok = tok->next;
     }
     return tok;
 }
 
-Token *manage_define(State *state, Token *tok) {
-    while (!tok->is_eol) {
+Token *manage_define(State *state, Token *command) {
+    UNUSED(state);
+    if (command->next == NULL || command->next->type != TKN_ID) {
+        report_error(command->next->location, command->next->pos, "Expected a MACRO identifier.");
+    }
+
+    Token copy = {0};
+    Token *macro = &copy;
+    Token *it = command->next;
+    while (it->next && it->is_eol == 0) {
+        macro = macro->next = token_copy(it);
+        macro->location = (TokenLocation){0};
+        it = it->next;
+    }
+    macro = macro->next = token_copy(it);
+    macro->location = (TokenLocation){0};
+    it = it->next;
+
+    macro->next = token_new(TKN_EOF, NULL, NULL, (TokenLocation){0});
+
+    // Should process macro here or on first usage?
+
+    Macro m = {.start = copy.next};
+    AC_ARRAY_PUSH(state->macros, m);
+
+    return it;
+}
+
+Token *manage_undef(State *state, Token *command) {
+    UNUSED(state);
+    Token *tok = command->next;
+    while (tok && !tok->is_eol && !(tok->type == TKN_EOF)) {
         tok = tok->next;
     }
     return tok;
 }
 
-Token *manage_undef(State *state, Token *tok) {
-    while (!tok->is_eol) {
+Token *manage_cond_block(State *state, Token *command) {
+    UNUSED(state);
+    Token *tok = command->next;
+    while (tok && !tok->is_eol && !(tok->type == TKN_EOF)) {
         tok = tok->next;
     }
     return tok;
 }
 
-Token *manage_cond_block(State *state, Token *tok) {
-    while (!tok->is_eol) {
+Token *manage_line(State *state, Token *command) {
+    UNUSED(state);
+    Token *tok = command->next;
+    while (tok && !tok->is_eol && !(tok->type == TKN_EOF)) {
         tok = tok->next;
     }
     return tok;
 }
 
-Token *manage_line(State *state, Token *tok) {
-    while (!tok->is_eol) {
+Token *manage_error(State *state, Token *command) {
+    UNUSED(state);
+    Token *it = command;
+    while (it && !it->is_eol) {
+        it = it->next;
+    }
+    if (it == command) {
+        report_error(it->location, it->pos, "error:");
+    } else {
+        report_error(it->location, it->pos, "error: %.*s", (int)it->len, it->pos);
+    }
+    return NULL;
+}
+
+Token *manage_pragma(State *state, Token *command) {
+    UNUSED(state);
+    Token *tok = command->next;
+    while (tok && !tok->is_eol && !(tok->type == TKN_EOF)) {
         tok = tok->next;
     }
     return tok;
 }
 
-Token *manage_pragma(State *state, Token *tok) {
-    while (!tok->is_eol) {
-        tok = tok->next;
-    }
-    return tok;
+Macro *macro_search(State *state, Token *tok) {
+    UNUSED(state);
+    UNUSED(tok);
+    return NULL;
 }
-
-Macro *macro_search(State *state, Token *tok) { return NULL; }
 
 Token *macro_expand(State *state, Macro *macro, Token *tok) {
+    UNUSED(state);
+    UNUSED(macro);
     return tok->next;
 }
 
@@ -696,6 +778,8 @@ Token *preprocess(State *state, Token *start) {
     Token *copy = &head;
     Token *cur = start;
     Token *prev = 0;
+    UNUSED(prev);
+
     while (cur && cur->type != TKN_EOF) {
         if (token_equal(cur, "#")) {
             Token *command = cur->next;
@@ -704,33 +788,25 @@ Token *preprocess(State *state, Token *start) {
             }
 
             if (token_equal(command, "include")) {
-                cur = manage_include(state, command->next);
+                cur = manage_include(state, command);
             } else if (token_equal(command, "define")) {
-                cur = manage_define(state, command->next);
+                cur = manage_define(state, command);
+                continue;
             } else if (token_equal(command, "undef")) {
-                cur = manage_undef(state, command->next);
+                cur = manage_undef(state, command);
             } else if (token_equal(command, "if") ||
                        token_equal(command, "ifdef") ||
                        token_equal(command, "ifndef") ||
                        token_equal(command, "elif") ||
                        token_equal(command, "else") ||
                        token_equal(command, "endif")) {
-                cur = manage_cond_block(state, command->next);
+                cur = manage_cond_block(state, command);
             } else if (token_equal(command, "line")) {
-                cur = manage_line(state, command->next);
+                cur = manage_line(state, command);
             } else if (token_equal(command, "error")) {
-                Token *it = command;
-                while (it && !it->is_eol) {
-                    it = it->next;
-                }
-                if (it == command) {
-                    report_error(it->location, it->pos, "error:");
-                } else {
-                    report_error(it->location, it->pos, "error: %.*s", (int)it->len,
-                                 it->pos);
-                }
+                cur = manage_error(state, command);
             } else if (token_equal(command, "pragma")) {
-                cur = manage_pragma(state, command->next);
+                cur = manage_pragma(state, command);
             } else {
                 report_error(cur->location, cur->pos, "Unknown preprocess command.");
             }
@@ -823,16 +899,17 @@ static Args parse_args(int argc, const char **argv) {
 
 Token *process_file_content(State *state, File file) {
     AC_ARRAY_PUSH(state->included, file);
-    Token *tok =
-        tokenize(state, &(state->included.items[state->included.count - 1]));
+    Token *tok = tokenize(state, &(state->included.items[state->included.count - 1]));
     if (tok == NULL)
         return NULL;
+    token_dump_full(tok);
     Token *ret = preprocess(state, tok);
     token_delete(tok);
     return ret;
 }
 
 Token *process_file(State *state, const char *filename, int search_local) {
+    UNUSED(search_local);
     // TODO: Manage search paths
     File file;
     if (read_file_content(filename, &file))
