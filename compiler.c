@@ -318,6 +318,7 @@ tokenize(State *state, File *file)
     const char *p = file->content;
     while (*p)
     {
+        p++;
     }
     return head.next;
 }
@@ -571,7 +572,7 @@ int main(int argc, const char **argv)
     Args args = parse_args(argc, argv);
     for (size_t i = 0; i < args.file_list.count; ++i)
     {
-        State state;
+        State state = {0};
         state_init(&state);
         LOG_INFO("Param %lu) %s", i, args.file_list.items[i]);
 
