@@ -34,13 +34,6 @@ typedef struct Args {
     ConstCharPtrArray file_list;
 } Args;
 
-typedef struct ConditionScope {
-    int skip;
-    int else_visited;
-    int ignore_and_skip;
-} ConditionScope;
-AC_ARRAY_DEFINE(ConditionScope);
-
 typedef struct File {
     const char *filename;
     const char *dirname;
@@ -58,6 +51,18 @@ typedef enum TokenKind {
     TKN_NUM,
     TKN_EOF
 } TokenKind;
+
+typedef enum OpType {
+    OP_SUM,
+    OP_SUB,
+    OP_MUL,
+    OP_DIV,
+    // OP_BAND,
+    // OP_BOR,
+    // OP_AND,
+    // OP_OR,
+    OP_EQ
+} OpType;
 
 typedef struct TokenLocation {
     File *file;
@@ -78,6 +83,14 @@ typedef struct Token {
 } Token;
 typedef Token *TokenPtr;
 AC_ARRAY_DEFINE(TokenPtr);
+
+typedef struct ConditionScope {
+    Token last;
+    int valid_block;
+    int else_visited;
+    int permits_elif;
+} ConditionScope;
+AC_ARRAY_DEFINE(ConditionScope);
 
 typedef struct Macro {
     Token *start;
@@ -103,6 +116,7 @@ typedef struct TokenizerError {
 } TokenizerError;
 
 Token *process_file_content(State *state, File file);
+Token *preprocess(State *state, Token *start);
 
 static void log_msg(FILE *out, const char *level, const char *fmt, ...) {
     va_list args;
@@ -114,6 +128,11 @@ static void log_msg(FILE *out, const char *level, const char *fmt, ...) {
 }
 
 static void get_line_at(const char *content, const char *pos, const char **start, const char **end) {
+    *start = NULL;
+    *end = NULL;
+    if (!content || !pos) {
+        return;
+    }
     const char *it = content;
     const char *line_start = it;
     while (it && *it != '\0' && it < pos) {
@@ -145,6 +164,12 @@ static int get_number_len(size_t num) {
 static void report_error(TokenLocation loc, const char *pos, const char *msg, ...) {
     const char *line_start = NULL;
     const char *line_end = NULL;
+
+    if (!loc.file || !pos) {
+        LOG_ERROR("Invalid token location");
+        abort();
+    }
+
     get_line_at(loc.file->content, pos, &line_start, &line_end);
     int line_len = line_end - line_start;
 
@@ -233,6 +258,10 @@ void token_delete(Token *tok) {
     }
 }
 
+int token_equals(const Token *l, const Token *r) {
+    return (l->len == r->len && strncmp(l->pos, r->pos, r->len) == 0);
+}
+
 int token_equal(Token *tok, const char *str) {
 #if 0
     if (!tok) {
@@ -264,6 +293,26 @@ token_dump_full(Token *t) {
         printf("$");
     }
     printf("\n");
+}
+
+Token *token_copy_until_eol(Token **tok) {
+    if (!tok) {
+        return NULL;
+    }
+
+    Token head;
+    Token *cur = &head;
+    while (*tok) {
+        cur = cur->next = token_copy(*tok);
+        if ((*tok)->is_eol) {
+            break;
+        }
+        *tok = (*tok)->next;
+    }
+    *tok = (*tok)->next;
+
+    cur = cur->next = token_new(TKN_EOF, NULL, NULL, (TokenLocation){0});
+    return head.next;
 }
 
 // process_file_content
@@ -665,7 +714,7 @@ static Token *tokenize(State *state, File *file) {
         } else if (error.message != NULL) {
             report_error(loc, error.pos, error.message);
         } else {
-            report_error(loc, p, "Unexpected token '%c' -> %d | 0x%X", *p, (int)*p, (int)*p);
+            report_error(loc, p, "Unexpected token '%c' -> %d | 0x%X (offset: %d)", *p, (int)*p, (int)*p, p - file->content);
         }
     }
 
@@ -674,12 +723,41 @@ static Token *tokenize(State *state, File *file) {
     return head.next;
 }
 
+int macro_search_index(State *state, Token *tok) {
+    int ret = -1;
+    for (size_t i = 0; i < state->macros.count; ++i) {
+        Macro m = state->macros.items[i];
+        if (token_equals(m.start, tok)) {
+            ret = (int)i;
+            break;
+        }
+    }
+
+    return ret;
+}
+
+Macro *macro_search(State *state, Token *tok) {
+    Macro *m = NULL;
+    int pos = macro_search_index(state, tok);
+    if (pos != -1) {
+        m = &state->macros.items[pos];
+    }
+    return m;
+}
+
+Token *macro_expand(State *state, Macro *macro, Token *tok) {
+    UNUSED(state);
+    UNUSED(macro);
+    return tok->next;
+}
+
 Token *manage_include(State *state, Token *command) {
     UNUSED(state);
     Token *tok = command->next;
-    while (tok && !tok->is_eol && !(tok->type == TKN_EOF)) {
-        tok = tok->next;
-    }
+
+    Token *file = token_copy_until_eol(&tok);
+    UNUSED(file);
+    // TODO: Do include the file!
     return tok;
 }
 
@@ -689,44 +767,256 @@ Token *manage_define(State *state, Token *command) {
         report_error(command->next->location, command->next->pos, "Expected a MACRO identifier.");
     }
 
-    Token copy = {0};
-    Token *macro = &copy;
-    Token *it = command->next;
-    while (it->next && it->is_eol == 0) {
-        macro = macro->next = token_copy(it);
-        macro->location = (TokenLocation){0};
-        it = it->next;
-    }
-    macro = macro->next = token_copy(it);
-    macro->location = (TokenLocation){0};
-    it = it->next;
-
-    macro->next = token_new(TKN_EOF, NULL, NULL, (TokenLocation){0});
+    Token *tok = command->next;
+    Token *macro = token_copy_until_eol(&tok);
 
     // Should process macro here or on first usage?
-
-    Macro m = {.start = copy.next};
+    Macro m = {.start = macro};
     AC_ARRAY_PUSH(state->macros, m);
 
-    return it;
+    LOG_DEBUG(" -> DEFINE continue with token '%.*s'", (int)tok->len, tok->pos);
+    return tok;
 }
 
 Token *manage_undef(State *state, Token *command) {
-    UNUSED(state);
-    Token *tok = command->next;
-    while (tok && !tok->is_eol && !(tok->type == TKN_EOF)) {
+    Token *name = command->next;
+    if (!name->is_eol || name->type != TKN_ID) {
+        report_error(name->location, name->pos, "ERROR: Macro name missing.");
+    }
+
+    int pos = macro_search_index(state, name);
+    if (pos != -1) {
+        AC_ARRAY_REMOVE(state->macros, pos);
+        // } else {
+        //     LOG_WARN("There is no macro defined as '%.*s'.", (int)name->len, name->pos);
+    }
+    return name->next;
+}
+
+int cond_block_eval(State *state, Token *command, Token *cond) {
+    int is_definition = 0;
+    int is_negated = 0;
+    if (token_equal(command, "ifdef")) {
+        is_definition = 1;
+    }
+    if (token_equal(command, "ifndef")) {
+        is_definition = 1;
+        is_negated = 1;
+    }
+    if (token_equal(command->next, "defined")) {
+        is_definition = 1;
+        cond = cond->next;
+    }
+
+    if (is_definition) {
+        if (cond->type != TKN_ID) {
+            report_error(cond->location, cond->pos, "Unexpected token on condition evaluation.");
+        }
+        int idx = macro_search_index(state, cond);
+        int is_defined = (idx != -1);
+        if (is_negated) {
+            is_defined = !is_defined;
+        }
+        return is_defined;
+    }
+
+    // should call to preprocess then evaluate const expression
+    Token *out = preprocess(state, cond);
+    Token *tmp = out;
+    if (tmp && tmp->is_eol) {
+        return atoi(tmp->pos);
+    }
+
+    // since we still have no lexer we compute simplest evaluation here
+    int level = 0;
+    int acc = 0;
+    int left = 0;
+    OpType op = OP_SUM;
+    int comparison_found = 0;
+    while (tmp && tmp->type != TKN_EOF) {
+        LOG_DEBUG("  >> EVAL token type %d '%.*s'", (int)tmp->type, (int)tmp->len, tmp->pos);
+        if (token_equal(tmp, "(")) {
+            level++;
+            tmp = tmp->next;
+        }
+        if (token_equal(tmp, ")")) {
+            level--;
+            tmp = tmp->next;
+        }
+
+        char *names[] = {"SUM (+)", "SUBSTRACT (-)", "MULTIPLY (*)", "DIVIDE (/)", "EQUAL (==)"};
+        if (tmp->type == TKN_NUM) {
+            int val = atoi(tmp->pos);
+            switch (op) {
+            case OP_SUM:
+                acc += val;
+                break;
+            case OP_SUB:
+                acc -= val;
+                break;
+            case OP_MUL:
+                acc *= val;
+                break;
+            case OP_DIV:
+                acc /= val;
+                break;
+            case OP_EQ:
+            default:
+                report_error(tmp->location, tmp->pos, "Invalid operator found, '==' is not well supported.");
+                break;
+            }
+            LOG_DEBUG("  >> Accumulate %d (op is %d) %s -> %d", val, (int)op, names[(int)op], acc);
+        } else if (tmp->type == TKN_PUNCT) {
+            if (token_equal(tmp, "+")) {
+                op = OP_SUM;
+            } else if (token_equal(tmp, "-")) {
+                op = OP_SUB;
+            } else if (token_equal(tmp, "*")) {
+                op = OP_MUL;
+            } else if (token_equal(tmp, "/")) {
+                op = OP_DIV;
+                // } else if (token_equal(tmp, "&")) {
+                //     op = OP_BAND;
+                // } else if (token_equal(tmp, "|")) {
+                //     op = OP_BOR;
+                // } else if (token_equal(tmp, "&&")) {
+                //     op = OP_AND;
+                // } else if (token_equal(tmp, "||")) {
+                //     op = OP_OR;
+            } else if (token_equal(tmp, "==")) {
+                if (comparison_found) { // Support just one comparision for now
+                    report_error(tmp->location, tmp->pos, "Repeated comparision, only one expected.");
+                }
+                left = acc;
+                acc = 0;
+                op = OP_SUM;
+                comparison_found = 1;
+            }
+            LOG_DEBUG("  >> Operator (op is %d) %s", (int)op, names[(int)op]);
+        }
+        if (tmp->is_eol) {
+            break;
+        }
+        tmp = tmp->next;
+    }
+    token_delete(out);
+
+    if (level != 0) {
+        report_error(cond->location, cond->pos, "Odd nuber of parentesis");
+    }
+
+    int ret = acc;
+    if (comparison_found) {
+        ret = (left == acc);
+    }
+
+    return ret;
+}
+
+Token *cond_block_skip(Token *tok) {
+    int level = 0;
+    LOG_DEBUG("  >> SKIP BLOCK", level);
+    while (tok->type != TKN_EOF) {
+        if (token_equal(tok, "#")) {
+            Token *command = tok->next;
+            if (token_equal(command, "if") || token_equal(command, "ifdef") || token_equal(command, "ifndef")) {
+                level++;
+                LOG_DEBUG("    >> UP '%.*s' (%d)", (int)command->len, command->pos, level);
+            } else if (token_equal(command, "endif") || token_equal(command, "else") || token_equal(command, "elif")) {
+                if (level == 0) {
+                    LOG_DEBUG("    >> END '%.*s' (%d)", (int)command->len, command->pos, level);
+                    break;
+                } else if (token_equal(command, "endif")) {
+                    LOG_DEBUG("    >> DOWN '%.*s' (%d)", (int)command->len, command->pos, level);
+                    level--;
+                }
+            }
+        }
         tok = tok->next;
     }
     return tok;
 }
 
-Token *manage_cond_block(State *state, Token *command) {
-    UNUSED(state);
+Token *manage_if_block(State *state, Token *command) {
+    LOG_DEBUG("");
+    int permits = token_equal(command, "if");
     Token *tok = command->next;
-    while (tok && !tok->is_eol && !(tok->type == TKN_EOF)) {
-        tok = tok->next;
+    Token *cond = token_copy_until_eol(&tok);
+    int val = cond_block_eval(state, command, cond);
+    token_delete(cond);
+
+    ConditionScope cond_block = {.last = *command, .valid_block = (val != 0), .else_visited = 0, .permits_elif = permits};
+    AC_ARRAY_PUSH(state->cond_scopes, cond_block);
+    LOG_DEBUG(" -> cond block (%p) '%.*s' (at level %lu) else_visited: %d, permits_elif: %d, valid_block: %d", command, (int)command->len, command->pos, state->cond_scopes.count, cond_block.else_visited, cond_block.permits_elif, cond_block.valid_block);
+
+    if (!val) {
+        tok = cond_block_skip(tok);
     }
+    LOG_DEBUG("   -> continue with token '%.*s'", (int)tok->len, tok->pos);
     return tok;
+}
+
+Token *manage_elif_block(State *state, Token *command) {
+    if (state->cond_scopes.count == 0) {
+        report_error(command->location, command->pos, "#elif without #if block");
+    }
+
+    ConditionScope scope = state->cond_scopes.items[state->cond_scopes.count - 1];
+    if (!scope.permits_elif) {
+        report_error(command->location, command->pos, "#elif not allowed (its #ifdef or #ifndef parent?)");
+    }
+
+    Token *tok = command->next;
+    Token *cond = token_copy_until_eol(&tok);
+    int cond_val = 0;
+    int val = !scope.valid_block && (cond_val = cond_block_eval(state, command, cond));
+    token_delete(cond);
+
+    LOG_DEBUG(" -> cond block (%p) '%.*s' (at level %lu) else_visited: %d, permits_elif: %d, valid_block: %d, cond_value: %d", command, (int)command->len, command->pos, state->cond_scopes.count, scope.else_visited, scope.permits_elif, scope.valid_block, cond_val);
+
+    state->cond_scopes.items[state->cond_scopes.count - 1].valid_block |= (val != 0);
+    state->cond_scopes.items[state->cond_scopes.count - 1].last = *command;
+
+    if (!val) {
+        tok = cond_block_skip(tok);
+    }
+    LOG_DEBUG("   -> continue with token '%.*s'", (int)tok->len, tok->pos);
+    return tok;
+}
+
+Token *manage_else_block(State *state, Token *command) {
+    if (state->cond_scopes.count == 0) {
+        report_error(command->location, command->pos, "#else without #if block");
+    }
+    ConditionScope scope = state->cond_scopes.items[state->cond_scopes.count - 1];
+    if (scope.else_visited) {
+        report_error(command->location, command->pos, "#else without #if block");
+    }
+
+    Token *tok = command->next;
+    int val = scope.valid_block;
+    state->cond_scopes.items[state->cond_scopes.count - 1].last = *command;
+
+    LOG_DEBUG(" -> cond block (%p) '%.*s' (at level %lu) else_visited: %d, permits_elif: %d, valid_block: %d", command, (int)command->len, command->pos, state->cond_scopes.count, scope.else_visited, scope.permits_elif, scope.valid_block);
+
+    if (val) {
+        tok = cond_block_skip(tok);
+    }
+    LOG_DEBUG("   -> continue with token '%.*s'", (int)tok->len, tok->pos);
+    return tok;
+}
+
+Token *manage_endif_block(State *state, Token *command) {
+    if (state->cond_scopes.count == 0) {
+        report_error(command->location, command->pos, "#endif without #if block");
+    }
+    ConditionScope scope;
+    AC_ARRAY_POP(state->cond_scopes, scope);
+    UNUSED(scope);
+
+    LOG_DEBUG(" -> cond block (%p) '%.*s' (at level %lu)", command, (int)command->len, command->pos, state->cond_scopes.count);
+
+    return command->next;
 }
 
 Token *manage_line(State *state, Token *command) {
@@ -761,18 +1051,6 @@ Token *manage_pragma(State *state, Token *command) {
     return tok;
 }
 
-Macro *macro_search(State *state, Token *tok) {
-    UNUSED(state);
-    UNUSED(tok);
-    return NULL;
-}
-
-Token *macro_expand(State *state, Macro *macro, Token *tok) {
-    UNUSED(state);
-    UNUSED(macro);
-    return tok->next;
-}
-
 Token *preprocess(State *state, Token *start) {
     Token head = {};
     Token *copy = &head;
@@ -791,16 +1069,20 @@ Token *preprocess(State *state, Token *start) {
                 cur = manage_include(state, command);
             } else if (token_equal(command, "define")) {
                 cur = manage_define(state, command);
-                continue;
             } else if (token_equal(command, "undef")) {
                 cur = manage_undef(state, command);
-            } else if (token_equal(command, "if") ||
-                       token_equal(command, "ifdef") ||
-                       token_equal(command, "ifndef") ||
-                       token_equal(command, "elif") ||
-                       token_equal(command, "else") ||
-                       token_equal(command, "endif")) {
-                cur = manage_cond_block(state, command);
+            } else if (token_equal(command, "if")) {
+                cur = manage_if_block(state, command);
+            } else if (token_equal(command, "ifdef")) {
+                cur = manage_if_block(state, command);
+            } else if (token_equal(command, "ifndef")) {
+                cur = manage_if_block(state, command);
+            } else if (token_equal(command, "elif")) {
+                cur = manage_elif_block(state, command);
+            } else if (token_equal(command, "else")) {
+                cur = manage_else_block(state, command);
+            } else if (token_equal(command, "endif")) {
+                cur = manage_endif_block(state, command);
             } else if (token_equal(command, "line")) {
                 cur = manage_line(state, command);
             } else if (token_equal(command, "error")) {
@@ -810,16 +1092,21 @@ Token *preprocess(State *state, Token *start) {
             } else {
                 report_error(cur->location, cur->pos, "Unknown preprocess command.");
             }
+            continue;
         } else {
             if (cur->type == TKN_ID) {
                 Macro *m = macro_search(state, cur);
-                if (!m) {
+                if (m) {
                     cur = macro_expand(state, m, cur);
                     continue;
                 } else {
+                    LOG_DEBUG("TOKEN: '%.*s'", (int)cur->len, cur->pos);
                     copy = copy->next = token_copy(cur);
                     prev = cur;
                 }
+            } else {
+                copy = copy->next = token_copy(cur);
+                prev = cur;
             }
         }
         cur = cur->next;
@@ -846,7 +1133,7 @@ static int read_file_content(const char *file_path, File *file) {
     if (fseek(fp, 0, SEEK_SET) < 0)
         goto finally;
 
-    char *content = (char *)malloc(count * sizeof(char));
+    char *content = (char *)malloc((count + 1) * sizeof(char));
 
     long total = 0;
     do {
@@ -856,6 +1143,7 @@ static int read_file_content(const char *file_path, File *file) {
         }
         total += read;
     } while (total < count);
+    content[count] = '\0';
 
     file->content = content;
     file->content_size = count;
@@ -934,6 +1222,13 @@ int main(int argc, const char **argv) {
         if (tok == NULL) {
             return 1;
         }
+
+        if (state.cond_scopes.count > 0) {
+            ConditionScope scope = state.cond_scopes.items[state.cond_scopes.count - 1];
+            report_error(scope.last.location, scope.last.pos, "Open cond block!");
+        }
+
+        token_dump_full(tok);
 
         // TODO: generate asm code
         state_cleanup(&state);
