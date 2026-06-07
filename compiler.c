@@ -26,6 +26,9 @@ static const char *macro_names = "#define __FILE__\n\
 #define LOG_WARN(fmt, ...) log_msg(stderr, "[WARN]", fmt, ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) log_msg(stderr, "[ERROR]", fmt, ##__VA_ARGS__)
 
+#undef LOG_DEBUG
+#define LOG_DEBUG(fmt, ...)
+
 typedef char Char;
 AC_ARRAY_DEFINE(Char);
 
@@ -37,6 +40,7 @@ AC_ARRAY_DEFINE(ConstCharPtr);
 
 typedef struct Args {
     ConstCharPtrArray file_list;
+    ConstCharPtrArray include_dir;
 } Args;
 
 typedef struct File {
@@ -985,10 +989,13 @@ int cond_block_eval(State *state, Token *command, Token *cond) {
     }
     if (token_equal(command->next, "defined")) {
         is_definition = 1;
-        cond = cond->next;
+        cond = cond->next->next;
     }
 
     if (is_definition) {
+        if (!cond) {
+            report_error(command->next->location, command->next->pos, "Unexpected token on condition evaluation.");
+        }
         if (cond->type != TKN_ID) {
             report_error(cond->location, cond->pos, "Unexpected token on condition evaluation.");
         }
@@ -1222,6 +1229,15 @@ Token *manage_error(State *state, Token *command) {
     return NULL;
 }
 
+Token *manage_warning(State *state, Token *command) {
+    UNUSED(state);
+    Token *tok = command;
+    Token *message = token_copy_until_eol(&tok);
+    LOG_WARN("warning:");
+    token_dump_full(message);
+    return tok;
+}
+
 Token *manage_pragma(State *state, Token *command) {
     UNUSED(state);
     Token *tok = command->next;
@@ -1265,6 +1281,8 @@ Token *preprocess(State *state, Token *start) {
                 cur = manage_endif_block(state, command);
             } else if (token_equal(command, "line")) {
                 cur = manage_line(state, command);
+            } else if (token_equal(command, "warning")) {
+                cur = manage_warning(state, command);
             } else if (token_equal(command, "error")) {
                 cur = manage_error(state, command);
             } else if (token_equal(command, "pragma")) {
@@ -1305,6 +1323,7 @@ static const char *arg_shift(int *argc, const char ***argv) {
 static Args arg_parse(int argc, const char **argv) {
     Args args = {0};
     args.file_list = AC_ARRAY_CREATE(ConstCharPtr, 16);
+    args.include_dir = AC_ARRAY_CREATE(ConstCharPtr, 16);
 
     const char *program = arg_shift(&argc, &argv);
     LOG_INFO("Current program: %s", program);
@@ -1313,6 +1332,11 @@ static Args arg_parse(int argc, const char **argv) {
         const char *param = arg_shift(&argc, &argv);
         if (param == NULL) {
             break;
+        }
+        if (strncmp(param, "-L", 2) == 0) {
+            const char *val = arg_shift(&argc, &argv);
+            AC_ARRAY_PUSH(args.include_dir, val);
+            continue;
         }
         AC_ARRAY_PUSH(args.file_list, param);
     }
@@ -1376,6 +1400,7 @@ static int file_search(State *state, const char *file_path, File *file, int sear
     file_release_content(file);
     for (int i = (int)start; i >= 0; i--) {
         const char *current_path = state->search_paths.items[i];
+        LOG_DEBUG(" >>> %lu) Searching for %s in %s (is_local: %d)", i, file_path, current_path, search_local);
 
         if (path_is_absolute(file_path)) {
             file->fullpath = strdup(file_path);
@@ -1481,7 +1506,11 @@ int main(int argc, const char **argv) {
     Args args = arg_parse(argc, argv);
     for (size_t i = 0; i < args.file_list.count; ++i) {
         State state = {0};
+        for (size_t i = 0; i < args.include_dir.count; i++) {
+            AC_ARRAY_PUSH(state.search_paths, args.include_dir.items[i]);
+        }
         state_init(&state);
+
         LOG_INFO("Param %lu) %s", i, args.file_list.items[i]);
 
         Token *tok = process_file(&state, args.file_list.items[i], 1);
