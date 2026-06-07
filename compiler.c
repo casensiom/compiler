@@ -12,6 +12,11 @@ static const char *macro_names = "#define __FILE__\n\
 #include <string.h>
 #include <sys/errno.h>
 #include <time.h>
+#ifdef _WIN32
+#include <direct.h> /* Windows: _getcwd */
+#else
+#include <unistd.h> /* POSIX: getcwd */
+#endif
 
 #include "array.h"
 
@@ -36,7 +41,7 @@ typedef struct Args {
 
 typedef struct File {
     const char *filename;
-    const char *dirname;
+    const char *fullpath;
     const char *content;
     size_t content_size;
     struct File *prev;
@@ -100,10 +105,13 @@ AC_ARRAY_DEFINE(Macro);
 typedef struct CompilerInfo {
     const char *date;
     const char *time;
+    const char *pwd;
+    size_t system_path_idx;
 } CompilerInfo;
 
 typedef struct State {
     FileArray included;
+    ConstCharPtrArray search_paths;
     ConditionScopeArray cond_scopes;
     MacroArray macros;
     TokenPtrArray tokens;
@@ -117,6 +125,9 @@ typedef struct TokenizerError {
 
 Token *process_file_content(State *state, File file);
 Token *preprocess(State *state, Token *start);
+static void file_delete(File *file);
+
+// -- Log --
 
 static void log_msg(FILE *out, const char *level, const char *fmt, ...) {
     va_list args;
@@ -191,6 +202,8 @@ static void report_error(TokenLocation loc, const char *pos, const char *msg, ..
     abort();
 }
 
+// -- String --
+
 static char *string_copy(const char *str, size_t len) {
     char *ret = NULL;
     if (len > 0) {
@@ -209,6 +222,76 @@ static char *string_format(const char *fmt, ...) {
     va_end(args);
     return ret;
 }
+
+static int string_ensure_len(const char *pos, size_t len) {
+    size_t i = 0;
+    while (pos[i] != '\0' && pos[i] != '"' && i < len) {
+        i++;
+    }
+    return i == len;
+}
+
+static const char *string_search_char(const char *str, char c, int occurrences) {
+    const char *p = str;
+    const char *last = NULL;
+
+    while (p && *p != '\0' && occurrences != 0) {
+        if (*p == c) {
+            last = p;
+            if (occurrences > 0)
+                occurrences--;
+        }
+        p++;
+    }
+
+    return last;
+}
+
+// -- Path --
+
+static char *path_current_dir() {
+#ifdef _WIN32
+    return _getcwd(NULL, 0);
+#else
+    return getcwd(NULL, 0);
+#endif
+}
+
+static int path_is_absolute(const char *file_path) {
+    UNUSED(file_path);
+    if (!file_path) {
+        return 0;
+    }
+
+#ifdef _WIN32
+    return (file_path[0] >= 'A' && file_path[0] <= '>' && file_path[1] == ':');
+#else
+    return (file_path[0] == '/');
+#endif
+
+    return 0;
+}
+
+static char *path_join(const char *path, const char *file) {
+    size_t len1 = strlen(path);
+    size_t len2 = strlen(file);
+
+    if (len1 == 0) {
+        return strdup(file);
+    } else if (len2 == 0) {
+        return strdup(path);
+    } else {
+        if (path[len1] == '/') {
+            return string_format("%s%s", path, file);
+        } else {
+            return string_format("%s/%s", path, file);
+        }
+    }
+
+    return NULL;
+}
+
+// -- Token --
 
 Token *token_new(TokenKind type, const char *s, const char *e, TokenLocation loc) {
     Token *ret = (Token *)calloc(1, sizeof(Token));
@@ -315,7 +398,8 @@ Token *token_copy_until_eol(Token **tok) {
     return head.next;
 }
 
-// process_file_content
+// -- State --
+
 void state_init(State *state) {
 
     time_t now = time(NULL);
@@ -324,39 +408,55 @@ void state_init(State *state) {
                                  "Aug", "Sep", "Oct", "Nov", "Dec"};
     state->info.date = string_format("\"%s %02d %d\"", month_name[tm->tm_mon], tm->tm_mday, tm->tm_year + 1900);
     state->info.time = string_format("\"%02d:%02d:%02d\"", tm->tm_hour, tm->tm_min, tm->tm_sec);
+    state->info.pwd = path_current_dir();
 
     size_t len = strlen(macro_names);
 
-    File file = {.filename = __FILE__,
-                 .content = macro_names,
+    const char *filename = strdup(__FILE__);
+    File file = {.content = strdup(macro_names),
                  .content_size = len,
-                 .dirname = NULL,
+                 .fullpath = filename,
+                 .filename = filename,
                  .prev = NULL};
     Token *tokens = process_file_content(state, file);
     token_delete(tokens);
+
+    // TODO: for each system path, add it here!
+
+    AC_ARRAY_PUSH(state->search_paths, state->info.pwd);
+    state->info.system_path_idx = state->search_paths.count;
 }
 void state_cleanup(State *state) {
-    // TODO: Remove elements from arrays
+    for (size_t i = 0; i < state->included.count; i++) {
+        file_delete(&state->included.items[i]);
+    }
+    for (size_t i = 0; i < state->macros.count; i++) {
+        token_delete(state->macros.items[i].start);
+    }
+    for (size_t i = 0; i < state->tokens.count; i++) {
+        token_delete(state->tokens.items[i]);
+    }
+    for (size_t i = 0; i < state->search_paths.capacity; i++) {
+        state->search_paths.items[i] = NULL;
+    }
     state->included.count = 0;
     state->cond_scopes.count = 0;
     state->macros.count = 0;
     state->tokens.count = 0;
+    state->search_paths.count = 0;
 
     if (state->info.date)
         free((void *)state->info.date);
     if (state->info.time)
         free((void *)state->info.time);
+    if (state->info.pwd)
+        free((void *)state->info.pwd);
     state->info.date = NULL;
     state->info.time = NULL;
+    state->info.pwd = NULL;
+    state->info.system_path_idx = 0;
 }
-
-static int ensure_string_len(const char *pos, size_t len) {
-    size_t i = 0;
-    while (pos[i] != '\0' && pos[i] != '"' && i < len) {
-        i++;
-    }
-    return i == len;
-}
+// -- Tokenizer --
 
 static size_t read_escape_sequence(const char *pos) {
     const char *p = pos;
@@ -382,11 +482,11 @@ static size_t read_escape_sequence(const char *pos) {
         len = 2;
     } else if (*p == '0') {
         len = 2;
-    } else if (*p == 'x' && ensure_string_len(p, 1 + 2)) {
+    } else if (*p == 'x' && string_ensure_len(p, 1 + 2)) {
         len = 2 + 2;
-    } else if (*p == 'u' && ensure_string_len(p, 1 + 4)) {
+    } else if (*p == 'u' && string_ensure_len(p, 1 + 4)) {
         len = 2 + 4;
-    } else if (*p == 'U' && ensure_string_len(p, 1 + 8)) {
+    } else if (*p == 'U' && string_ensure_len(p, 1 + 8)) {
         len = 2 + 8;
     }
     return len;
@@ -723,6 +823,8 @@ static Token *tokenize(State *state, File *file) {
     return head.next;
 }
 
+// -- Macro --
+
 int macro_search_index(State *state, Token *tok) {
     int ret = -1;
     for (size_t i = 0; i < state->macros.count; ++i) {
@@ -748,16 +850,22 @@ Macro *macro_search(State *state, Token *tok) {
 Token *macro_expand(State *state, Macro *macro, Token *tok) {
     UNUSED(state);
     UNUSED(macro);
+    // TODO: Do expand the token!
     return tok->next;
 }
 
-Token *manage_include(State *state, Token *command) {
+// --Preprocessor--
+
+Token *
+manage_include(State *state, Token *command) {
     UNUSED(state);
     Token *tok = command->next;
 
     Token *file = token_copy_until_eol(&tok);
-    UNUSED(file);
     // TODO: Do include the file!
+    printf(" -> INCLUDE: ");
+    token_dump_full(file);
+    token_delete(file);
     return tok;
 }
 
@@ -1092,37 +1200,120 @@ Token *preprocess(State *state, Token *start) {
             } else {
                 report_error(cur->location, cur->pos, "Unknown preprocess command.");
             }
-            continue;
         } else {
             if (cur->type == TKN_ID) {
                 Macro *m = macro_search(state, cur);
                 if (m) {
                     cur = macro_expand(state, m, cur);
                     continue;
-                } else {
-                    LOG_DEBUG("TOKEN: '%.*s'", (int)cur->len, cur->pos);
-                    copy = copy->next = token_copy(cur);
-                    prev = cur;
                 }
-            } else {
-                copy = copy->next = token_copy(cur);
-                prev = cur;
             }
+            LOG_DEBUG("TOKEN: '%.*s'", (int)cur->len, cur->pos);
+            copy = copy->next = token_copy(cur);
+            prev = cur;
+            cur = cur->next;
         }
-        cur = cur->next;
     }
     return head.next;
 }
 
-static int read_file_content(const char *file_path, File *file) {
-    file->content = NULL;
-    file->content_size = 0;
-    file->filename = file_path; // basename(file_path);
-    // file->dirname = dirname(file_path);
-    //  TODO: manage file and path split
+// -- Args --
 
-    int ret = 1;
-    FILE *fp = fopen(file_path, "r");
+static const char *arg_shift(int *argc, const char ***argv) {
+    if (*argc <= 0) {
+        return NULL;
+    }
+    const char *ret = **argv;
+    (*argv)++;
+    (*argc)--;
+    return ret;
+}
+
+static Args arg_parse(int argc, const char **argv) {
+    Args args = {0};
+    args.file_list = AC_ARRAY_CREATE(ConstCharPtr, 16);
+
+    const char *program = arg_shift(&argc, &argv);
+    LOG_INFO("Current program: %s", program);
+
+    while (1) {
+        const char *param = arg_shift(&argc, &argv);
+        if (param == NULL) {
+            break;
+        }
+        AC_ARRAY_PUSH(args.file_list, param);
+    }
+    return args;
+}
+
+// -- File management --
+
+static int file_exists(const char *file_path) {
+#if _WIN32
+    LOG_ERROR("Method 'file_exists' not yet implemented for windows!");
+    abort();
+#else
+    return (access(file_path, F_OK) == 0);
+#endif
+    return 0;
+}
+
+static void file_delete(File *file) {
+    file->content_size = 0;
+    if (file->content) {
+        free((void *)file->content);
+        file->content = NULL;
+    }
+
+    if (file->fullpath) {
+        free((void *)file->fullpath);
+        file->fullpath = NULL;
+    }
+    file->filename = NULL; // filename is reference to fullpath
+}
+
+static int file_search(State *state, const char *file_path, File *file, int search_local) {
+    int ret = 0;
+
+    // TODO: Implement search in local and/or system paths
+    // state->search_paths has all the include paths:
+    // - The paths sould be ordered first should be the sistem paths, then the current path (pwd), then the inherited ones
+    // - The loop must traverse the items in reverse order, the more recent added the first.
+    // - There should be an index pointing to the current path (pwd)
+    // - If the flag 'search_local' is active then the loop starts at state->search_paths.count-1, otherwise it starts at index
+    size_t start = state->info.system_path_idx;
+    if (search_local) {
+        start = state->search_paths.count - 1;
+    }
+
+    file_delete(file);
+    for (int i = (int)start; i >= 0; i--) {
+        const char *current_path = state->search_paths.items[i];
+
+        if (path_is_absolute(file_path)) {
+            file->fullpath = strdup(file_path);
+        } else {
+            file->fullpath = path_join(current_path, file_path);
+        }
+        file->filename = string_search_char(file->fullpath, '/', -1) + 1;
+        if (file_exists(file->fullpath)) {
+            ret = 1;
+            break;
+        }
+        file_delete(file);
+    }
+    return ret;
+}
+
+static int file_read_content(File *file) {
+    FILE *fp = NULL;
+    int ret = 0;
+
+    if (file->fullpath == NULL) {
+        goto finally;
+    }
+
+    fp = fopen(file->fullpath, "r");
     if (!fp)
         goto finally;
     if (fseek(fp, 0, SEEK_END) < 0)
@@ -1148,42 +1339,22 @@ static int read_file_content(const char *file_path, File *file) {
     file->content = content;
     file->content_size = count;
 
-    ret = 0;
+    ret = 1;
 finally:
-    if (ret > 0)
-        LOG_ERROR("Can't read file '%s' (errno %d: %s)", file_path, errno,
-                  strerror(errno));
+    if (!ret) {
+        if (file->filename) {
+            LOG_ERROR("Can't read file '%s' (errno %d: %s)", file->filename, errno, strerror(errno));
+        } else {
+            LOG_ERROR("File properties are not set, can't load an undefined file.");
+        }
+        file_delete(file);
+    }
     if (fp)
         fclose(fp);
     return ret;
 }
 
-static const char *shift(int *argc, const char ***argv) {
-    if (*argc <= 0) {
-        return NULL;
-    }
-    const char *ret = **argv;
-    (*argv)++;
-    (*argc)--;
-    return ret;
-}
-
-static Args parse_args(int argc, const char **argv) {
-    Args args = {0};
-    args.file_list = AC_ARRAY_CREATE(ConstCharPtr, 16);
-
-    const char *program = shift(&argc, &argv);
-    UNUSED(program);
-
-    while (1) {
-        const char *param = shift(&argc, &argv);
-        if (param == NULL) {
-            break;
-        }
-        AC_ARRAY_PUSH(args.file_list, param);
-    }
-    return args;
-}
+// -- Compiler program --
 
 Token *process_file_content(State *state, File file) {
     AC_ARRAY_PUSH(state->included, file);
@@ -1199,9 +1370,16 @@ Token *process_file_content(State *state, File file) {
 Token *process_file(State *state, const char *filename, int search_local) {
     UNUSED(search_local);
     // TODO: Manage search paths
-    File file;
-    if (read_file_content(filename, &file))
+    File file = {0};
+    if (!file_search(state, filename, &file, search_local)) {
+        LOG_ERROR("Can't locate the file '%s' within the search paths [%lu in total]", filename, state->search_paths.count);
         return NULL;
+    }
+
+    //
+    if (!file_read_content(&file)) {
+        return NULL;
+    }
 
     return process_file_content(state, file);
 }
@@ -1212,7 +1390,7 @@ int main(int argc, const char **argv) {
         return 1;
     }
 
-    Args args = parse_args(argc, argv);
+    Args args = arg_parse(argc, argv);
     for (size_t i = 0; i < args.file_list.count; ++i) {
         State state = {0};
         state_init(&state);
