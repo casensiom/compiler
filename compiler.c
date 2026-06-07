@@ -46,7 +46,8 @@ typedef struct File {
     size_t content_size;
     struct File *prev;
 } File;
-AC_ARRAY_DEFINE(File);
+typedef File *FilePtr;
+AC_ARRAY_DEFINE(FilePtr);
 
 typedef enum TokenKind {
     TKN_UNKNOWN,
@@ -110,7 +111,7 @@ typedef struct CompilerInfo {
 } CompilerInfo;
 
 typedef struct State {
-    FileArray included;
+    FilePtrArray included;
     ConstCharPtrArray search_paths;
     ConditionScopeArray cond_scopes;
     MacroArray macros;
@@ -125,7 +126,10 @@ typedef struct TokenizerError {
 
 Token *process_file_content(State *state, File file);
 Token *preprocess(State *state, Token *start);
+static void file_release_content(File *file);
 static void file_delete(File *file);
+static int file_search(State *state, const char *file_path, File *file, int search_local);
+static int file_read_content(File *file);
 
 // -- Log --
 
@@ -398,6 +402,20 @@ Token *token_copy_until_eol(Token **tok) {
     return head.next;
 }
 
+Token *token_replace_with(Token *start, TokenKind type, Token *next) {
+    Token *cur = start;
+    Token *found = NULL;
+    while (cur) {
+        if (!cur->next || (cur->next && cur->next->type == type)) {
+            found = cur->next;
+            break;
+        }
+        cur = cur->next;
+    }
+    cur->next = next;
+    return found;
+}
+
 // -- State --
 
 void state_init(State *state) {
@@ -426,9 +444,10 @@ void state_init(State *state) {
     AC_ARRAY_PUSH(state->search_paths, state->info.pwd);
     state->info.system_path_idx = state->search_paths.count;
 }
+
 void state_cleanup(State *state) {
     for (size_t i = 0; i < state->included.count; i++) {
-        file_delete(&state->included.items[i]);
+        file_delete(state->included.items[i]);
     }
     for (size_t i = 0; i < state->macros.count; i++) {
         token_delete(state->macros.items[i].start);
@@ -456,6 +475,7 @@ void state_cleanup(State *state) {
     state->info.pwd = NULL;
     state->info.system_path_idx = 0;
 }
+
 // -- Tokenizer --
 
 static size_t read_escape_sequence(const char *pos) {
@@ -858,15 +878,67 @@ Token *macro_expand(State *state, Macro *macro, Token *tok) {
 
 Token *
 manage_include(State *state, Token *command) {
-    UNUSED(state);
     Token *tok = command->next;
+    const char *filename = NULL;
 
-    Token *file = token_copy_until_eol(&tok);
-    // TODO: Do include the file!
+    // get file name
+    Token *include_file = token_copy_until_eol(&tok);
     printf(" -> INCLUDE: ");
-    token_dump_full(file);
-    token_delete(file);
-    return tok;
+    token_dump_full(include_file);
+    int is_local = (include_file->type == TKN_STR);
+    const char *start = NULL;
+    int len = 0;
+    if (is_local) {
+        start = include_file->pos + 1;
+        len = include_file->len - 2;
+    } else if (token_equal(include_file, "<")) {
+        Token *it = include_file->next;
+        start = it->pos;
+        while (it && it->type != TKN_EOF && !it->is_eol) {
+            len += it->len;
+            it = it->next;
+        }
+    }
+    if (!start || len <= 0) {
+        report_error(include_file->location, include_file->pos, "Unexpected file name definition on include command.");
+    }
+    filename = string_copy(start, len);
+    token_delete(include_file);
+
+    // search for file
+    File file = {0};
+    if (!file_search(state, filename, &file, is_local)) {
+        report_error(command->location, command->pos, "Unable to find the file to include.");
+    }
+
+    // check if already included
+    int is_included = 0;
+    for (size_t i = 0; i < state->included.count && !is_included; i++) {
+        is_included = (strcmp(state->included.items[i]->fullpath, file.fullpath) == 0);
+    }
+    // TODO: Also check if pragma once
+    if (is_included) {
+        file_read_content(&file);
+        return tok;
+    }
+
+    // load file
+    if (!file_read_content(&file)) {
+        file_release_content(&file);
+        report_error(command->location, command->pos, "Error loading content from include file.");
+    }
+
+    // process file
+    Token *included = process_file_content(state, file);
+    if (!included) {
+        return tok;
+    }
+
+    // Replace the last EOL token with tok
+    Token *found = token_replace_with(included, TKN_EOF, tok);
+    token_delete(found);
+
+    return included;
 }
 
 Token *manage_define(State *state, Token *command) {
@@ -1214,6 +1286,7 @@ Token *preprocess(State *state, Token *start) {
             cur = cur->next;
         }
     }
+    copy->next = token_new(TKN_EOF, NULL, NULL, (TokenLocation){0});
     return head.next;
 }
 
@@ -1258,7 +1331,16 @@ static int file_exists(const char *file_path) {
     return 0;
 }
 
-static void file_delete(File *file) {
+static File *file_copy(File *file) {
+    File *ret = (File *)malloc(sizeof(File));
+    ret->content_size = file->content_size;
+    ret->content = file->content;
+    ret->fullpath = file->fullpath;
+    ret->filename = file->filename;
+    return ret;
+}
+
+static void file_release_content(File *file) {
     file->content_size = 0;
     if (file->content) {
         free((void *)file->content);
@@ -1272,6 +1354,11 @@ static void file_delete(File *file) {
     file->filename = NULL; // filename is reference to fullpath
 }
 
+static void file_delete(File *file) {
+    file_release_content(file);
+    free(file);
+}
+
 static int file_search(State *state, const char *file_path, File *file, int search_local) {
     int ret = 0;
 
@@ -1281,12 +1368,12 @@ static int file_search(State *state, const char *file_path, File *file, int sear
     // - The loop must traverse the items in reverse order, the more recent added the first.
     // - There should be an index pointing to the current path (pwd)
     // - If the flag 'search_local' is active then the loop starts at state->search_paths.count-1, otherwise it starts at index
-    size_t start = state->info.system_path_idx;
+    size_t start = state->info.system_path_idx - 1;
     if (search_local) {
         start = state->search_paths.count - 1;
     }
 
-    file_delete(file);
+    file_release_content(file);
     for (int i = (int)start; i >= 0; i--) {
         const char *current_path = state->search_paths.items[i];
 
@@ -1300,7 +1387,7 @@ static int file_search(State *state, const char *file_path, File *file, int sear
             ret = 1;
             break;
         }
-        file_delete(file);
+        file_release_content(file);
     }
     return ret;
 }
@@ -1357,8 +1444,9 @@ finally:
 // -- Compiler program --
 
 Token *process_file_content(State *state, File file) {
-    AC_ARRAY_PUSH(state->included, file);
-    Token *tok = tokenize(state, &(state->included.items[state->included.count - 1]));
+    File *copy = file_copy(&file);
+    AC_ARRAY_PUSH(state->included, copy);
+    Token *tok = tokenize(state, copy);
     if (tok == NULL)
         return NULL;
     token_dump_full(tok);
