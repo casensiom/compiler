@@ -4,7 +4,9 @@ static const char *macro_names = "#define __FILE__\n\
         #define __TIME__\n\
         #define __STDC__ 1\n\
         #define __STDC_VERSION__ 199409L\n\
-        #define __STDC_HOSTED__ 1\n";
+        #define __STDC_HOSTED__ 1\n\
+        #define __x86_64__ 1\n\
+        #define __GNUC__ 4\n";
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -180,7 +182,7 @@ static int get_number_len(size_t num) {
     return len;
 }
 
-static void report_error(TokenLocation loc, const char *pos, const char *msg, ...) {
+static void report_message_internal(TokenLocation loc, const char *pos, const char *msg, va_list args) {
     const char *line_start = NULL;
     const char *line_end = NULL;
 
@@ -192,20 +194,33 @@ static void report_error(TokenLocation loc, const char *pos, const char *msg, ..
     get_line_at(loc.file->content, pos, &line_start, &line_end);
     int line_len = line_end - line_start;
 
-    // LOG_DEBUG("POINTER: (%p) [%p <= %p <= %p] %.*s", loc.file->content, line_start, pos, line_end, line_len, line_start);
-    // LOG_DEBUG("MESSAGE: %s", message); LOG_DEBUG("LOCATION: line = %lu, column = %lu", loc.line, loc.column);
-    // LOG_DEBUG("LENGHT: %d", line_len);
-    // LOG_DEBUG("CONTENT: %s", loc.file->content);
+#if 0
+    LOG_DEBUG("POINTER: (%p) [%p <= %p <= %p] %.*s", loc.file->content, line_start, pos, line_end, line_len, line_start);
+    LOG_DEBUG("MESSAGE: %s", message); LOG_DEBUG("LOCATION: line = %lu, column = %lu", loc.line, loc.column);
+    LOG_DEBUG("LENGHT: %d", line_len);
+    LOG_DEBUG("CONTENT: %s", loc.file->content);
+#endif
 
     size_t column = loc.column + 1;
     printf("%s:%lu:%lu: ", loc.file->filename, loc.line + 1, column);
-    va_list args;
-    va_start(args, msg);
     vprintf(msg, args);
-    va_end(args);
     printf("\n");
     printf(" %lu | %.*s\n", column, line_len, line_start);
     printf("%*s\n", get_number_len(column) + (int)column + 4, "^");
+}
+
+static void report_message(TokenLocation loc, const char *pos, const char *msg, ...) {
+    va_list args;
+    va_start(args, msg);
+    report_message_internal(loc, pos, msg, args);
+    va_end(args);
+}
+
+static void report_error(TokenLocation loc, const char *pos, const char *msg, ...) {
+    va_list args;
+    va_start(args, msg);
+    report_message_internal(loc, pos, msg, args);
+    va_end(args);
 
     abort();
 }
@@ -443,8 +458,10 @@ void state_init(State *state) {
     Token *tokens = process_file_content(state, file);
     token_delete(tokens);
 
-    // TODO: for each system path, add it here!
-
+    // WARN: Remove these system paths, or find them in a better way
+    AC_ARRAY_PUSH(state->search_paths, "/usr/include");
+    AC_ARRAY_PUSH(state->search_paths, "/usr/local/include");
+    AC_ARRAY_PUSH(state->search_paths, "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include");
     AC_ARRAY_PUSH(state->search_paths, state->info.pwd);
     state->info.system_path_idx = state->search_paths.count;
 }
@@ -547,6 +564,23 @@ static Token *tokenize_number(const char *pos, TokenLocation loc, TokenizerError
     error->pos = p;
     error->message = NULL;
 
+    if (isdigit(p[0]) || (p[0] == '.' && isdigit(p[1]))) {
+        const char *q = p;
+        while (isdigit(p[0]) || (p[0] == '.')) {
+            p++;
+        }
+
+        token = token_new(TKN_NUM, q, p, loc);
+    }
+    return token;
+}
+
+static Token *tokenize_number2(const char *pos, TokenLocation loc, TokenizerError *error) {
+    Token *token = NULL;
+    const char *p = pos;
+    error->pos = p;
+    error->message = NULL;
+
     // ([0-9]+(\.[0-9]*)?|\.[0-9]+)[eE][+-]?[0-9]+
     if (isdigit(p[0]) || (p[0] == '.' && isdigit(p[1]))) {
         const char *q = p;
@@ -556,16 +590,19 @@ static Token *tokenize_number(const char *pos, TokenLocation loc, TokenizerError
         do {
             if (p[0] == '.') {
                 if (has_dot) {
+                    error->pos = p;
                     error->message = "Invalid dot in decimal number.";
                     break;
                 }
                 if (has_exp) {
+                    error->pos = p;
                     error->message = "Invalid dot in exponent.";
                     break;
                 }
                 has_dot = 1;
             } else if (p[0] == 'e' || p[0] == 'E') {
                 if (has_exp) {
+                    error->pos = p;
                     error->message = "Invalid exponent in scientific notation";
                     break;
                 }
@@ -819,15 +856,15 @@ static Token *tokenize(State *state, File *file) {
 
         TokenizerError error = {0};
         Token *t = NULL;
-        if (!t)
+        if (!t && !error.message)
             t = tokenize_number(p, loc, &error);
-        if (!t)
+        if (!t && !error.message)
             t = tokenize_string(p, loc, &error);
-        if (!t)
+        if (!t && !error.message)
             t = tokenize_literal(p, loc, &error);
-        if (!t)
+        if (!t && !error.message)
             t = tokenize_ident(p, loc, &error);
-        if (!t)
+        if (!t && !error.message)
             t = tokenize_punctuation(p, loc, &error);
 
         if (t != NULL) {
@@ -887,8 +924,6 @@ manage_include(State *state, Token *command) {
 
     // get file name
     Token *include_file = token_copy_until_eol(&tok);
-    printf(" -> INCLUDE: ");
-    token_dump_full(include_file);
     int is_local = (include_file->type == TKN_STR);
     const char *start = NULL;
     int len = 0;
@@ -934,7 +969,7 @@ manage_include(State *state, Token *command) {
 
     // process file
     Token *included = process_file_content(state, file);
-    if (!included) {
+    if (!included || included->type == TKN_EOF) {
         return tok;
     }
 
@@ -977,127 +1012,79 @@ Token *manage_undef(State *state, Token *command) {
     return name->next;
 }
 
+int cond_block_eval_recursive(State *state, Token *cur, int in) {
+    if (!cur || cur->type == TKN_EOF) {
+        return in; // end recursive calls
+    }
+    if (token_equal(cur, "!")) {
+        return !cond_block_eval_recursive(state, cur->next, in);
+    } else if (token_equal(cur, "defined")) {
+        if (token_equal(cur->next, "(") &&
+            cur->next->next->type == TKN_ID &&
+            token_equal(cur->next->next->next, ")")) {
+            in = (macro_search_index(state, cur->next->next) != -1);
+        } else {
+            report_error(cur->next->location, cur->next->pos, "Unexpected token '%.*s', was expecting '( ID )'", (int)cur->next->len, cur->next->pos);
+        }
+        return cond_block_eval_recursive(state, cur->next->next->next->next, in);
+    } else if (cur->type == TKN_NUM) {
+        in = atoi(cur->pos);
+        return cond_block_eval_recursive(state, cur->next, in);
+    } else if (cur->type == TKN_PUNCT) {
+        if (token_equal(cur, "&&")) {
+            return in && cond_block_eval_recursive(state, cur->next, 0);
+        } else if (token_equal(cur, "||")) {
+            return in || cond_block_eval_recursive(state, cur->next, 0);
+        } else if (token_equal(cur, "+")) {
+            return in + cond_block_eval_recursive(state, cur->next, 0);
+        } else if (token_equal(cur, "-")) {
+            return in - cond_block_eval_recursive(state, cur->next, 0);
+        } else if (token_equal(cur, "==")) {
+            return in == cond_block_eval_recursive(state, cur->next, 0);
+        } else if (token_equal(cur, "<")) {
+            return in < cond_block_eval_recursive(state, cur->next, 0);
+        } else if (token_equal(cur, ">")) {
+            return in > cond_block_eval_recursive(state, cur->next, 0);
+        } else if (token_equal(cur, "<=")) {
+            return in <= cond_block_eval_recursive(state, cur->next, 0);
+        } else if (token_equal(cur, ">=")) {
+            return in >= cond_block_eval_recursive(state, cur->next, 0);
+        } else if (token_equal(cur, "(")) {
+            return cond_block_eval_recursive(state, cur->next, in);
+        } else if (token_equal(cur, ")")) {
+            return cond_block_eval_recursive(state, cur->next, in);
+        } else {
+            report_error(cur->location, cur->pos, "Unexpected token '%.*s'", (int)cur->len, cur->pos);
+        }
+    } else if (cur->type == TKN_ID) {
+        // report_error(cur->location, cur->pos, "Not yet implemented macro expansion '%.*s'", (int)cur->len, cur->pos);
+        // Assume its a defined value
+        report_message(cur->location, cur->pos, "[WARNING] Not yet implemented macro expansion '%.*s'", (int)cur->len, cur->pos);
+        Macro *m = macro_search(state, cur);
+        if (m) {
+            in = atoi(m->start->next->pos);
+        } else {
+            in = 0;
+        }
+        return cond_block_eval_recursive(state, cur->next, in);
+    } else {
+        report_error(cur->location, cur->pos, "Unexpected token '%.*s'", (int)cur->len, cur->pos);
+    }
+    return in;
+}
+
 int cond_block_eval(State *state, Token *command, Token *cond) {
-    int is_definition = 0;
-    int is_negated = 0;
+    int evaluated = 0;
     if (token_equal(command, "ifdef")) {
-        is_definition = 1;
+        evaluated = (macro_search_index(state, cond) != -1);
+    } else if (token_equal(command, "ifndef")) {
+        evaluated = (macro_search_index(state, cond) == -1);
+    } else if (token_equal(command, "if") || token_equal(command, "elif")) {
+        evaluated = cond_block_eval_recursive(state, cond, 0);
+    } else {
+        report_error(command->location, command->pos, "Unexpected token '%.*s', only expected #if, #elif, #ifdef or #ifndef", (int)command->len, command->pos);
     }
-    if (token_equal(command, "ifndef")) {
-        is_definition = 1;
-        is_negated = 1;
-    }
-    if (token_equal(command->next, "defined")) {
-        is_definition = 1;
-        cond = cond->next->next;
-    }
-
-    if (is_definition) {
-        if (!cond) {
-            report_error(command->next->location, command->next->pos, "Unexpected token on condition evaluation.");
-        }
-        if (cond->type != TKN_ID) {
-            report_error(cond->location, cond->pos, "Unexpected token on condition evaluation.");
-        }
-        int idx = macro_search_index(state, cond);
-        int is_defined = (idx != -1);
-        if (is_negated) {
-            is_defined = !is_defined;
-        }
-        return is_defined;
-    }
-
-    // should call to preprocess then evaluate const expression
-    Token *out = preprocess(state, cond);
-    Token *tmp = out;
-    if (tmp && tmp->is_eol) {
-        return atoi(tmp->pos);
-    }
-
-    // since we still have no lexer we compute simplest evaluation here
-    int level = 0;
-    int acc = 0;
-    int left = 0;
-    OpType op = OP_SUM;
-    int comparison_found = 0;
-    while (tmp && tmp->type != TKN_EOF) {
-        LOG_DEBUG("  >> EVAL token type %d '%.*s'", (int)tmp->type, (int)tmp->len, tmp->pos);
-        if (token_equal(tmp, "(")) {
-            level++;
-            tmp = tmp->next;
-        }
-        if (token_equal(tmp, ")")) {
-            level--;
-            tmp = tmp->next;
-        }
-
-        char *names[] = {"SUM (+)", "SUBSTRACT (-)", "MULTIPLY (*)", "DIVIDE (/)", "EQUAL (==)"};
-        if (tmp->type == TKN_NUM) {
-            int val = atoi(tmp->pos);
-            switch (op) {
-            case OP_SUM:
-                acc += val;
-                break;
-            case OP_SUB:
-                acc -= val;
-                break;
-            case OP_MUL:
-                acc *= val;
-                break;
-            case OP_DIV:
-                acc /= val;
-                break;
-            case OP_EQ:
-            default:
-                report_error(tmp->location, tmp->pos, "Invalid operator found, '==' is not well supported.");
-                break;
-            }
-            LOG_DEBUG("  >> Accumulate %d (op is %d) %s -> %d", val, (int)op, names[(int)op], acc);
-        } else if (tmp->type == TKN_PUNCT) {
-            if (token_equal(tmp, "+")) {
-                op = OP_SUM;
-            } else if (token_equal(tmp, "-")) {
-                op = OP_SUB;
-            } else if (token_equal(tmp, "*")) {
-                op = OP_MUL;
-            } else if (token_equal(tmp, "/")) {
-                op = OP_DIV;
-                // } else if (token_equal(tmp, "&")) {
-                //     op = OP_BAND;
-                // } else if (token_equal(tmp, "|")) {
-                //     op = OP_BOR;
-                // } else if (token_equal(tmp, "&&")) {
-                //     op = OP_AND;
-                // } else if (token_equal(tmp, "||")) {
-                //     op = OP_OR;
-            } else if (token_equal(tmp, "==")) {
-                if (comparison_found) { // Support just one comparision for now
-                    report_error(tmp->location, tmp->pos, "Repeated comparision, only one expected.");
-                }
-                left = acc;
-                acc = 0;
-                op = OP_SUM;
-                comparison_found = 1;
-            }
-            LOG_DEBUG("  >> Operator (op is %d) %s", (int)op, names[(int)op]);
-        }
-        if (tmp->is_eol) {
-            break;
-        }
-        tmp = tmp->next;
-    }
-    token_delete(out);
-
-    if (level != 0) {
-        report_error(cond->location, cond->pos, "Odd nuber of parentesis");
-    }
-
-    int ret = acc;
-    if (comparison_found) {
-        ret = (left == acc);
-    }
-
-    return ret;
+    return evaluated;
 }
 
 Token *cond_block_skip(Token *tok) {
@@ -1149,10 +1136,6 @@ Token *manage_elif_block(State *state, Token *command) {
     }
 
     ConditionScope scope = state->cond_scopes.items[state->cond_scopes.count - 1];
-    if (!scope.permits_elif) {
-        report_error(command->location, command->pos, "#elif not allowed (its #ifdef or #ifndef parent?)");
-    }
-
     Token *tok = command->next;
     Token *cond = token_copy_until_eol(&tok);
     int cond_val = 0;
@@ -1386,33 +1369,52 @@ static void file_delete(File *file) {
 static int file_search(State *state, const char *file_path, File *file, int search_local) {
     int ret = 0;
 
-    // TODO: Implement search in local and/or system paths
-    // state->search_paths has all the include paths:
-    // - The paths sould be ordered first should be the sistem paths, then the current path (pwd), then the inherited ones
-    // - The loop must traverse the items in reverse order, the more recent added the first.
-    // - There should be an index pointing to the current path (pwd)
-    // - If the flag 'search_local' is active then the loop starts at state->search_paths.count-1, otherwise it starts at index
-    size_t start = state->info.system_path_idx - 1;
-    if (search_local) {
-        start = state->search_paths.count - 1;
-    }
+    file->filename = NULL;
 
-    file_release_content(file);
-    for (int i = (int)start; i >= 0; i--) {
-        const char *current_path = state->search_paths.items[i];
-        LOG_DEBUG(" >>> %lu) Searching for %s in %s (is_local: %d)", i, file_path, current_path, search_local);
+    if (path_is_absolute(file_path)) {
+        if (!file_exists(file_path)) {
+            return ret;
+        }
 
-        if (path_is_absolute(file_path)) {
-            file->fullpath = strdup(file_path);
-        } else {
-            file->fullpath = path_join(current_path, file_path);
+        file->fullpath = strdup(file_path);
+        for (size_t i = 0; i < state->search_paths.count; i++) {
+            size_t len = strlen(state->search_paths.items[i]);
+            if (strncmp(file->fullpath, state->search_paths.items[i], len) == 0) {
+                file->filename = file->fullpath + len;
+                break;
+            }
         }
-        file->filename = string_search_char(file->fullpath, '/', -1) + 1;
-        if (file_exists(file->fullpath)) {
-            ret = 1;
-            break;
+
+        if (file->filename == NULL) {
+            file->filename = string_search_char(file->fullpath, '/', -1) + 1;
         }
+
+        ret = 1;
+    } else {
+        // TODO: Implement search in local and/or system paths
+        // state->search_paths has all the include paths:
+        // - The paths sould be ordered first should be the sistem paths, then the current path (pwd), then the inherited ones
+        // - The loop must traverse the items in reverse order, the more recent added the first.
+        // - There should be an index pointing to the current path (pwd)
+        // - If the flag 'search_local' is active then the loop starts at state->search_paths.count-1, otherwise it starts at index
+        size_t start = state->info.system_path_idx - 1;
+        if (search_local) {
+            start = state->search_paths.count - 1;
+        }
+
         file_release_content(file);
+        for (int i = (int)start; i >= 0; i--) {
+            const char *current_path = state->search_paths.items[i];
+            LOG_INFO(" >>> %lu) Searching for %s in %s (is_local: %d)", i, file_path, current_path, search_local);
+
+            file->fullpath = path_join(current_path, file_path);
+            file->filename = file->fullpath + strlen(current_path) + 1;
+            if (file_exists(file->fullpath)) {
+                ret = 1;
+                break;
+            }
+            file_release_content(file);
+        }
     }
     return ret;
 }
@@ -1520,7 +1522,7 @@ int main(int argc, const char **argv) {
 
         if (state.cond_scopes.count > 0) {
             ConditionScope scope = state.cond_scopes.items[state.cond_scopes.count - 1];
-            report_error(scope.last.location, scope.last.pos, "Open cond block!");
+            report_error(scope.last.location, scope.last.pos, "Open cond block! (%ul)", state.cond_scopes.count - 1);
         }
 
         token_dump_full(tok);
