@@ -105,9 +105,14 @@ typedef struct ConditionScope {
 AC_ARRAY_DEFINE(ConditionScope);
 
 typedef struct Macro {
-    Token *start;
+    int is_func;
+    int is_variadic;
+    Token *name;
+    TokenPtrArray args;
+    TokenPtrArray body;
 } Macro;
-AC_ARRAY_DEFINE(Macro);
+typedef Macro *MacroPtr;
+AC_ARRAY_DEFINE(MacroPtr);
 
 typedef struct CompilerInfo {
     const char *date;
@@ -120,7 +125,7 @@ typedef struct State {
     FilePtrArray included;
     ConstCharPtrArray search_paths;
     ConditionScopeArray cond_scopes;
-    MacroArray macros;
+    MacroPtrArray macros;
     TokenPtrArray tokens;
     CompilerInfo info;
 } State;
@@ -435,6 +440,115 @@ Token *token_replace_with(Token *start, TokenKind type, Token *next) {
     return found;
 }
 
+// -- Macro --
+
+Macro *macro_new() {
+    Macro *ret = (Macro *)calloc(1, sizeof(Macro));
+    return ret;
+}
+void macro_delete(Macro *macro) {
+    if (!macro)
+        return;
+
+    macro->is_func = 0;
+    macro->is_variadic = 0;
+    token_delete(macro->name);
+    AC_ARRAY_FOREACH(TokenPtr, it, macro->args) {
+        token_delete(*it);
+    }
+    AC_ARRAY_FOREACH(TokenPtr, it, macro->body) {
+        token_delete(*it);
+    }
+    macro->args.count = 0;
+    macro->body.count = 0;
+
+    free(macro);
+}
+
+Macro *macro_read(State *state, Token **tok) {
+    UNUSED(state);
+    // process macro
+    Token *name = *tok;
+    int is_func = !name->has_spaces && token_equal(name->next, "(");
+    int is_variadic = 0;
+    TokenPtrArray args = {0};
+    TokenPtrArray body = {0};
+
+    // collect macro arguments
+    Token *it = name->next;
+    while (is_func && it && it->type != TKN_EOF) {
+        if (it->type == TKN_ID) {
+            AC_ARRAY_PUSH(args, token_copy(it));
+        } else if (token_equal(it, ")")) {
+            it = it->next; // stop
+            break;
+        } else if (token_equal(it, "...")) {
+            is_variadic = 1;
+        } else if (token_equal(it, "(") || token_equal(it, ",")) {
+            // skip
+        } else {
+            report_error(it->location, it->pos, "Expected identifier, found '%.*s'", (int)it->len, it->pos);
+        }
+        it = it->next;
+    }
+
+    // collect macro body
+    if (!name->is_eol) {
+        while (it && it->type != TKN_EOF) {
+            // Should be expanding these tokens here ?
+            AC_ARRAY_PUSH(body, token_copy(it));
+            if (it->is_eol) {
+                break;
+            }
+            it = it->next;
+        }
+    } else {
+        it = name; // rewind one token
+    }
+
+    Macro *m = macro_new();
+    *m = (Macro){.name = token_copy(name), .is_func = is_func, .is_variadic = is_variadic, .args = args, .body = body};
+
+    *tok = it;
+    return m;
+}
+
+int macro_search_index(State *state, Token *tok) {
+    int ret = -1;
+    AC_ARRAY_FOREACH(MacroPtr, it, state->macros) {
+        if (token_equals((*it)->name, tok)) {
+            ret = (int)(it - state->macros.items);
+            break;
+        }
+    }
+
+    // for (size_t i = 0; i < state->macros.count; ++i) {
+    //     Macro *m = state->macros.items[i];
+    //     if (token_equals(m->name, tok)) {
+    //         ret = (int)i;
+    //         break;
+    //     }
+    // }
+
+    return ret;
+}
+
+Macro *macro_search(State *state, Token *tok) {
+    Macro *m = NULL;
+    int pos = macro_search_index(state, tok);
+    if (pos != -1) {
+        m = state->macros.items[pos];
+    }
+    return m;
+}
+
+Token *macro_expand(State *state, Macro *macro, Token *tok) {
+    UNUSED(state);
+    UNUSED(macro);
+    // TODO: Do expand the token!
+    return tok->next;
+}
+
 // -- State --
 
 void state_init(State *state) {
@@ -467,17 +581,17 @@ void state_init(State *state) {
 }
 
 void state_cleanup(State *state) {
-    for (size_t i = 0; i < state->included.count; i++) {
-        file_delete(state->included.items[i]);
+    AC_ARRAY_FOREACH(FilePtr, it, state->included) {
+        file_delete(*it);
     }
-    for (size_t i = 0; i < state->macros.count; i++) {
-        token_delete(state->macros.items[i].start);
+    AC_ARRAY_FOREACH(MacroPtr, it, state->macros) {
+        macro_delete(*it);
     }
-    for (size_t i = 0; i < state->tokens.count; i++) {
-        token_delete(state->tokens.items[i]);
+    AC_ARRAY_FOREACH(TokenPtr, it, state->tokens) {
+        token_delete(*it);
     }
-    for (size_t i = 0; i < state->search_paths.capacity; i++) {
-        state->search_paths.items[i] = NULL;
+    AC_ARRAY_FOREACH(ConstCharPtr, it, state->search_paths) {
+        *it = NULL;
     }
     state->included.count = 0;
     state->cond_scopes.count = 0;
@@ -884,37 +998,6 @@ static Token *tokenize(State *state, File *file) {
     return head.next;
 }
 
-// -- Macro --
-
-int macro_search_index(State *state, Token *tok) {
-    int ret = -1;
-    for (size_t i = 0; i < state->macros.count; ++i) {
-        Macro m = state->macros.items[i];
-        if (token_equals(m.start, tok)) {
-            ret = (int)i;
-            break;
-        }
-    }
-
-    return ret;
-}
-
-Macro *macro_search(State *state, Token *tok) {
-    Macro *m = NULL;
-    int pos = macro_search_index(state, tok);
-    if (pos != -1) {
-        m = &state->macros.items[pos];
-    }
-    return m;
-}
-
-Token *macro_expand(State *state, Macro *macro, Token *tok) {
-    UNUSED(state);
-    UNUSED(macro);
-    // TODO: Do expand the token!
-    return tok->next;
-}
-
 // --Preprocessor--
 
 Token *
@@ -981,20 +1064,15 @@ manage_include(State *state, Token *command) {
 }
 
 Token *manage_define(State *state, Token *command) {
-    UNUSED(state);
     if (command->next == NULL || command->next->type != TKN_ID) {
         report_error(command->next->location, command->next->pos, "Expected a MACRO identifier.");
     }
 
     Token *tok = command->next;
-    Token *macro = token_copy_until_eol(&tok);
-
-    // Should process macro here or on first usage?
-    Macro m = {.start = macro};
+    Macro *m = macro_read(state, &tok);
     AC_ARRAY_PUSH(state->macros, m);
 
-    LOG_DEBUG(" -> DEFINE continue with token '%.*s'", (int)tok->len, tok->pos);
-    return tok;
+    return tok->next;
 }
 
 Token *manage_undef(State *state, Token *command) {
@@ -1062,7 +1140,7 @@ int cond_block_eval_recursive(State *state, Token *cur, int in) {
         report_message(cur->location, cur->pos, "[WARNING] Not yet implemented macro expansion '%.*s'", (int)cur->len, cur->pos);
         Macro *m = macro_search(state, cur);
         if (m) {
-            in = atoi(m->start->next->pos);
+            in = (m->body.count >= 1) ? atoi(m->body.items[0]->pos) : 1;
         } else {
             in = 0;
         }
@@ -1316,7 +1394,7 @@ static Args arg_parse(int argc, const char **argv) {
         if (param == NULL) {
             break;
         }
-        if (strncmp(param, "-L", 2) == 0) {
+        if (strncmp(param, "-I", 2) == 0) {
             const char *val = arg_shift(&argc, &argv);
             AC_ARRAY_PUSH(args.include_dir, val);
             continue;
@@ -1526,6 +1604,23 @@ int main(int argc, const char **argv) {
         }
 
         token_dump_full(tok);
+
+        AC_ARRAY_FOREACH(MacroPtr, it, state.macros) {
+            int idx = (int)(it - state.macros.items);
+            LOG_INFO("Macro %d) '%.*s'", idx, (int)(*it)->name->len, (*it)->name->pos);
+            if ((*it)->args.count > 0) {
+                LOG_INFO("    ARGS:");
+                AC_ARRAY_FOREACH(TokenPtr, a, (*it)->args) {
+                    LOG_INFO("    - '%.*s'", (int)(*a)->len, (*a)->pos);
+                }
+            }
+            if ((*it)->body.count > 0) {
+                LOG_INFO("    BODY:");
+                AC_ARRAY_FOREACH(TokenPtr, b, (*it)->body) {
+                    LOG_INFO("    - '%.*s'", (int)(*b)->len, (*b)->pos);
+                }
+            }
+        }
 
         // TODO: generate asm code
         state_cleanup(&state);
