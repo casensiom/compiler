@@ -109,7 +109,7 @@ typedef struct Macro {
     int is_variadic;
     Token *name;
     TokenPtrArray args;
-    TokenPtrArray body;
+    Token *body;
 } Macro;
 typedef Macro *MacroPtr;
 AC_ARRAY_DEFINE(MacroPtr);
@@ -192,7 +192,7 @@ static void report_message_internal(TokenLocation loc, const char *pos, const ch
     const char *line_end = NULL;
 
     if (!loc.file || !pos) {
-        LOG_ERROR("Invalid token location");
+        LOG_ERROR("Invalid token location: '%s'", msg);
         abort();
     }
 
@@ -214,7 +214,7 @@ static void report_message_internal(TokenLocation loc, const char *pos, const ch
     printf("%*s\n", get_number_len(column) + (int)column + 4, "^");
 }
 
-static void report_message(TokenLocation loc, const char *pos, const char *msg, ...) {
+void report_message(TokenLocation loc, const char *pos, const char *msg, ...) {
     va_list args;
     va_start(args, msg);
     report_message_internal(loc, pos, msg, args);
@@ -321,7 +321,7 @@ static char *path_join(const char *path, const char *file) {
 
 // -- Token --
 
-Token *token_new(TokenKind type, const char *s, const char *e, TokenLocation loc) {
+static Token *token_new(TokenKind type, const char *s, const char *e, TokenLocation loc) {
     Token *ret = (Token *)calloc(1, sizeof(Token));
     ret->type = type;
     ret->location = loc;
@@ -335,14 +335,16 @@ Token *token_new(TokenKind type, const char *s, const char *e, TokenLocation loc
     return ret;
 }
 
-Token *token_from_string(TokenKind type, const char *str, TokenLocation loc) {
+#if 0
+static Token *token_from_string(TokenKind type, const char *str, TokenLocation loc) {
     size_t len = strlen(str);
     Token *ret = token_new(type, str, str + len, loc);
     ret->str = str;
     return ret;
 }
+#endif
 
-Token *token_copy(Token *orig) {
+static Token *token_copy(Token *orig) {
     Token *ret = (Token *)calloc(1, sizeof(Token));
     *ret = *orig;
     ret->next = NULL;
@@ -350,7 +352,43 @@ Token *token_copy(Token *orig) {
     return ret;
 }
 
-void token_delete(Token *tok) {
+static Token *token_clone(Token *orig) {
+    Token copy = {0};
+    Token *it = &copy;
+    while (orig) {
+        it = it->next = token_copy(orig);
+        orig = orig->next;
+    }
+    return copy.next;
+}
+
+static Token *token_join(Token *left, Token *right) {
+    Token *ret = (Token *)calloc(1, sizeof(Token));
+    ret->next = NULL;
+    ret->str = string_format("%.*s%.*s", (int)left->len, left->pos, (int)right->len, right->pos);
+    ret->pos = ret->str;
+    ret->len = strlen(ret->str); // left->len + right->len;
+    ret->type = left->type;
+    ret->location = left->location;
+    ret->is_eol = right->is_eol;
+    ret->has_spaces = right->has_spaces;
+    return ret;
+}
+
+static Token *token_stringify(Token *orig) {
+    Token *ret = (Token *)calloc(1, sizeof(Token));
+    ret->next = NULL;
+    ret->str = string_format("\"%.*s\"", (int)orig->len, orig->pos);
+    ret->pos = ret->str;
+    ret->len = strlen(ret->str); // orig->len + 2;
+    ret->type = TKN_STR;
+    ret->location = orig->location;
+    ret->is_eol = orig->is_eol;
+    ret->has_spaces = orig->has_spaces;
+    return ret;
+}
+
+static void token_delete(Token *tok) {
     while (tok != NULL) {
         Token *next = tok->next;
         if (tok->str) {
@@ -369,11 +407,11 @@ void token_delete(Token *tok) {
     }
 }
 
-int token_equals(const Token *l, const Token *r) {
+static int token_equals(const Token *l, const Token *r) {
     return (l->len == r->len && strncmp(l->pos, r->pos, r->len) == 0);
 }
 
-int token_equal(Token *tok, const char *str) {
+static int token_equal(Token *tok, const char *str) {
 #if 0
     if (!tok) {
         printf("Invalid token pointer.\n");
@@ -393,8 +431,7 @@ int token_equal(Token *tok, const char *str) {
     return (tok && str && (strlen(str) == tok->len) && (strncmp(tok->pos, str, tok->len) == 0));
 }
 
-static void
-token_dump_full(Token *t) {
+static void token_dump_full(Token *t) {
     printf(" > ");
     while (t && t->type != TKN_EOF) {
         printf(" %.*s", (int)t->len, t->pos);
@@ -406,12 +443,12 @@ token_dump_full(Token *t) {
     printf("\n");
 }
 
-Token *token_copy_until_eol(Token **tok) {
+static Token *token_copy_until_eol(Token **tok) {
     if (!tok) {
         return NULL;
     }
 
-    Token head;
+    Token head = {0};
     Token *cur = &head;
     while (*tok) {
         cur = cur->next = token_copy(*tok);
@@ -420,59 +457,68 @@ Token *token_copy_until_eol(Token **tok) {
         }
         *tok = (*tok)->next;
     }
-    *tok = (*tok)->next;
 
     cur = cur->next = token_new(TKN_EOF, NULL, NULL, (TokenLocation){0});
     return head.next;
 }
 
-Token *token_replace_with(Token *start, TokenKind type, Token *next) {
-    Token *cur = start;
+static Token *token_last(Token *start) {
+    Token *it = start;
     Token *found = NULL;
-    while (cur) {
-        if (!cur->next || (cur->next && cur->next->type == type)) {
-            found = cur->next;
+    while (it) {
+        if (!it->next || it->type == TKN_EOF || (it->next && it->next->type == TKN_EOF)) {
+            found = it;
             break;
         }
-        cur = cur->next;
+        it = it->next;
     }
-    cur->next = next;
+    return found;
+}
+
+static Token *token_link(Token *start, Token *next) {
+    Token *found = token_last(start);
+    if (found) {
+        token_delete(found->next);
+        found->next = next;
+    }
     return found;
 }
 
 // -- Macro --
 
-Macro *macro_new() {
+static Macro *macro_new() {
     Macro *ret = (Macro *)calloc(1, sizeof(Macro));
     return ret;
 }
-void macro_delete(Macro *macro) {
+static void macro_delete(Macro *macro) {
     if (!macro)
         return;
 
     macro->is_func = 0;
     macro->is_variadic = 0;
+
     token_delete(macro->name);
+    macro->name = NULL;
+
+    token_delete(macro->body);
+    macro->body = NULL;
+
     AC_ARRAY_FOREACH(TokenPtr, it, macro->args) {
         token_delete(*it);
     }
-    AC_ARRAY_FOREACH(TokenPtr, it, macro->body) {
-        token_delete(*it);
-    }
     macro->args.count = 0;
-    macro->body.count = 0;
 
     free(macro);
 }
 
-Macro *macro_read(State *state, Token **tok) {
+static Macro *macro_read(State *state, Token **tok) {
     UNUSED(state);
     // process macro
     Token *name = *tok;
     int is_func = !name->has_spaces && token_equal(name->next, "(");
     int is_variadic = 0;
     TokenPtrArray args = {0};
-    TokenPtrArray body = {0};
+    Token *body = NULL;
 
     // collect macro arguments
     Token *it = name->next;
@@ -494,13 +540,8 @@ Macro *macro_read(State *state, Token **tok) {
 
     // collect macro body
     if (!name->is_eol) {
-        while (it && it->type != TKN_EOF) {
-            // Should be expanding these tokens here ?
-            AC_ARRAY_PUSH(body, token_copy(it));
-            if (it->is_eol) {
-                break;
-            }
-            it = it->next;
+        if (it && it->type != TKN_EOF) {
+            body = token_copy_until_eol(&it);
         }
     } else {
         it = name; // rewind one token
@@ -513,7 +554,7 @@ Macro *macro_read(State *state, Token **tok) {
     return m;
 }
 
-int macro_search_index(State *state, Token *tok) {
+static int macro_search_index(State *state, Token *tok) {
     int ret = -1;
     AC_ARRAY_FOREACH(MacroPtr, it, state->macros) {
         if (token_equals((*it)->name, tok)) {
@@ -521,19 +562,10 @@ int macro_search_index(State *state, Token *tok) {
             break;
         }
     }
-
-    // for (size_t i = 0; i < state->macros.count; ++i) {
-    //     Macro *m = state->macros.items[i];
-    //     if (token_equals(m->name, tok)) {
-    //         ret = (int)i;
-    //         break;
-    //     }
-    // }
-
     return ret;
 }
 
-Macro *macro_search(State *state, Token *tok) {
+static Macro *macro_search(State *state, Token *tok) {
     Macro *m = NULL;
     int pos = macro_search_index(state, tok);
     if (pos != -1) {
@@ -542,16 +574,168 @@ Macro *macro_search(State *state, Token *tok) {
     return m;
 }
 
-Token *macro_expand(State *state, Macro *macro, Token *tok) {
+static TokenPtrArray macro_collect_args(State *state, Macro *macro, Token **tok) {
     UNUSED(state);
-    UNUSED(macro);
-    // TODO: Do expand the token!
-    return tok->next;
+    TokenPtrArray params = {0};
+
+    if (!macro || !token_equals(*tok, macro->name)) {
+        report_error((*tok)->location, (*tok)->pos, "Unexpected macro replacement.");
+    }
+
+    if (!macro->is_func) {
+        *tok = (*tok)->next;
+        return params;
+    }
+
+    if ((*tok)->type != TKN_ID) {
+        report_error((*tok)->location, (*tok)->pos, "Expected macro name.");
+    }
+    *tok = (*tok)->next;
+    if (!token_equal(*tok, "(")) {
+        report_error((*tok)->location, (*tok)->pos, "Expected parentesis after macro name.");
+    }
+    *tok = (*tok)->next;
+    int level = 1;
+
+    Token copy = {0};
+    Token *p = &copy;
+    while (*tok && (*tok)->type != TKN_EOF) {
+        if (token_equal(*tok, "(")) {
+            level++;
+        }
+        if (token_equal(*tok, ")")) {
+            level--;
+            if (level == 0) {
+                break;
+            }
+        }
+
+        if (token_equal(*tok, ",")) {
+            if (macro->is_variadic && params.count >= macro->args.count) {
+                // fulfill the variadics
+                p = p->next = token_copy(*tok);
+            } else {
+                AC_ARRAY_PUSH(params, copy.next);
+                copy.next = NULL;
+                p = &copy;
+            }
+        } else {
+            p = p->next = token_copy(*tok);
+        }
+        *tok = (*tok)->next;
+    }
+    if (copy.next) {
+        AC_ARRAY_PUSH(params, copy.next);
+    }
+    return params;
+}
+
+static int search_param(Token *t, TokenPtrArray *array) {
+    int idx = -1;
+    AC_ARRAY_FOREACH(TokenPtr, c, *array) {
+        if (token_equals(t, *c)) {
+            idx = (int)(c - array->items);
+            break;
+        }
+    }
+    return idx;
+}
+
+static Token *find_replacement(Macro *macro, TokenPtrArray *params, Token *it) {
+    Token *ret;
+    int pos = search_param(it, &(macro->args));
+    if (pos != -1 && pos < (int)params->count) {
+        ret = token_clone(params->items[pos]);
+    } else {
+        ret = token_copy(it);
+    }
+    return ret;
+}
+
+static Token *search_replacement(Macro *macro, TokenPtrArray *params, Token *it) {
+    Token *ret;
+    int pos = search_param(it, &(macro->args));
+    if (pos != -1 && pos < (int)params->count) {
+        ret = params->items[pos];
+    } else {
+        ret = it;
+    }
+    return ret;
+}
+
+static Token *macro_expand(State *state, Macro *macro, Token **tok) {
+    if (!(*tok)) {
+        report_error(macro->name->location, macro->name->pos, "Invalid macro usage.");
+    }
+
+    Token head = {0};
+    Token *copy = &head;
+    TokenPtrArray params = macro_collect_args(state, macro, tok);
+
+    Token *it = macro->body;
+    while (it) {
+        if (it->type == TKN_EOF) {
+            break;
+        }
+
+        Token *candidate = NULL;
+        if (token_equal(it, "#")) {
+            it = it->next;
+            Token *expanded = find_replacement(macro, &params, it);
+            candidate = token_stringify(expanded);
+            token_delete(expanded);
+            // if (token_equals(candidate, it)) {
+            //     report_error(it->location, it->pos, "Unexpected stringify token, found '%.*s', expected definition identifier.", (int)it->len, it->pos);
+            // }
+        } else if (token_equal(it->next, "##")) {
+            if (token_equal(it, ",") && token_equal(it->next->next, "__VA_ARGS__")) {
+                if (params.count > macro->args.count) {
+                    Token *first = token_copy(it);
+                    first->next = token_clone(params.items[macro->args.count]);
+                    candidate = first;
+                    it = it->next->next->next;
+                } else {
+                    it = it->next->next->next;
+                    continue;
+                }
+            } else {
+                if (it->type == TKN_PUNCT || it->next->next->type == TKN_PUNCT) {
+                    report_error(it->next->location, it->next->pos, "Invalid join command.");
+                }
+                Token *left = search_replacement(macro, &params, it);
+                Token *right = search_replacement(macro, &params, it->next->next);
+                candidate = token_join(left, right);
+                it = it->next->next;
+            }
+        } else if (token_equal(it, "__VA_ARGS__")) {
+            if (params.count > macro->args.count) {
+                candidate = token_clone(params.items[macro->args.count]);
+            }
+        } else if (it->type == TKN_ID) {
+            candidate = find_replacement(macro, &params, it);
+        } else {
+            candidate = token_copy(it);
+        }
+
+        copy->next = candidate;
+        while (copy->next) {
+            copy = copy->next;
+        }
+
+        it = it->next;
+    }
+
+    AC_ARRAY_FOREACH(TokenPtr, c, params) {
+        token_delete(*c);
+    }
+    AC_ARRAY_DESTROY(params);
+
+    return head.next;
 }
 
 // -- State --
 
-void state_init(State *state) {
+static void state_init(State *state) {
 
     time_t now = time(NULL);
     struct tm *tm = localtime(&now);
@@ -580,7 +764,7 @@ void state_init(State *state) {
     state->info.system_path_idx = state->search_paths.count;
 }
 
-void state_cleanup(State *state) {
+static void state_cleanup(State *state) {
     AC_ARRAY_FOREACH(FilePtr, it, state->included) {
         file_delete(*it);
     }
@@ -609,6 +793,22 @@ void state_cleanup(State *state) {
     state->info.time = NULL;
     state->info.pwd = NULL;
     state->info.system_path_idx = 0;
+}
+
+static void state_dump(State *state) {
+    AC_ARRAY_FOREACH(MacroPtr, it, state->macros) {
+        int idx = (int)(it - state->macros.items);
+        LOG_INFO("Macro %d) '%.*s'", idx, (int)(*it)->name->len, (*it)->name->pos);
+        if ((*it)->args.count > 0) {
+            LOG_INFO("    ARGS:");
+            AC_ARRAY_FOREACH(TokenPtr, a, (*it)->args) {
+                LOG_INFO("    - '%.*s'", (int)(*a)->len, (*a)->pos);
+            }
+        }
+
+        LOG_INFO("    BODY:");
+        token_dump_full((*it)->body);
+    }
 }
 
 // -- Tokenizer --
@@ -680,7 +880,7 @@ static Token *tokenize_number(const char *pos, TokenLocation loc, TokenizerError
 
     if (isdigit(p[0]) || (p[0] == '.' && isdigit(p[1]))) {
         const char *q = p;
-        while (isdigit(p[0]) || (p[0] == '.')) {
+        while (isalnum(p[0]) || (p[0] == '_') || (p[0] == '.')) {
             p++;
         }
 
@@ -689,7 +889,7 @@ static Token *tokenize_number(const char *pos, TokenLocation loc, TokenizerError
     return token;
 }
 
-static Token *tokenize_number2(const char *pos, TokenLocation loc, TokenizerError *error) {
+Token *tokenize_number2(const char *pos, TokenLocation loc, TokenizerError *error) {
     Token *token = NULL;
     const char *p = pos;
     error->pos = p;
@@ -1000,8 +1200,7 @@ static Token *tokenize(State *state, File *file) {
 
 // --Preprocessor--
 
-Token *
-manage_include(State *state, Token *command) {
+Token *manage_include(State *state, Token *command, Token **copy) {
     Token *tok = command->next;
     const char *filename = NULL;
 
@@ -1040,7 +1239,7 @@ manage_include(State *state, Token *command) {
     }
     // TODO: Also check if pragma once
     if (is_included) {
-        file_read_content(&file);
+        file_release_content(&file);
         return tok;
     }
 
@@ -1056,11 +1255,13 @@ manage_include(State *state, Token *command) {
         return tok;
     }
 
-    // Replace the last EOL token with tok
-    Token *found = token_replace_with(included, TKN_EOF, tok);
-    token_delete(found);
+    Token *last = token_last(included);
+    if (last != NULL) {
+        (*copy)->next = included;
+        *copy = last;
+    }
 
-    return included;
+    return tok;
 }
 
 Token *manage_define(State *state, Token *command) {
@@ -1072,22 +1273,22 @@ Token *manage_define(State *state, Token *command) {
     Macro *m = macro_read(state, &tok);
     AC_ARRAY_PUSH(state->macros, m);
 
-    return tok->next;
+    return tok;
 }
 
 Token *manage_undef(State *state, Token *command) {
-    Token *name = command->next;
-    if (!name->is_eol || name->type != TKN_ID) {
-        report_error(name->location, name->pos, "ERROR: Macro name missing.");
+    Token *tok = command->next;
+    if (!tok->is_eol || tok->type != TKN_ID) {
+        report_error(tok->location, tok->pos, "ERROR: Macro name missing.");
     }
 
-    int pos = macro_search_index(state, name);
+    int pos = macro_search_index(state, tok);
     if (pos != -1) {
         AC_ARRAY_REMOVE(state->macros, pos);
         // } else {
-        //     LOG_WARN("There is no macro defined as '%.*s'.", (int)name->len, name->pos);
+        //     LOG_WARN("There is no macro defined as '%.*s'.", (int)tok->len, tok->pos);
     }
-    return name->next;
+    return tok;
 }
 
 int cond_block_eval_recursive(State *state, Token *cur, int in) {
@@ -1132,19 +1333,34 @@ int cond_block_eval_recursive(State *state, Token *cur, int in) {
         } else if (token_equal(cur, ")")) {
             return cond_block_eval_recursive(state, cur->next, in);
         } else {
+            AC_ARRAY_FOREACH(FilePtr, f, state->included) {
+                LOG_INFO("included: %s", (*f)->fullpath);
+            }
             report_error(cur->location, cur->pos, "Unexpected token '%.*s'", (int)cur->len, cur->pos);
         }
     } else if (cur->type == TKN_ID) {
-        // report_error(cur->location, cur->pos, "Not yet implemented macro expansion '%.*s'", (int)cur->len, cur->pos);
-        // Assume its a defined value
-        report_message(cur->location, cur->pos, "[WARNING] Not yet implemented macro expansion '%.*s'", (int)cur->len, cur->pos);
         Macro *m = macro_search(state, cur);
+        Token *next = cur->next;
         if (m) {
-            in = (m->body.count >= 1) ? atoi(m->body.items[0]->pos) : 1;
+            if (m->body) {
+                Token *expanded = macro_expand(state, m, &cur);
+                in = cond_block_eval_recursive(state, expanded, 0);
+                token_delete(expanded);
+                next = cur;
+            } else {
+                in = 1;
+            }
         } else {
-            in = 0;
+            if (!cur->has_spaces && token_equal(cur->next, "(")) {
+                report_error(cur->location, cur->pos, "function-like macro '%.*s' is not defined", (int)cur->len, cur->pos);
+            } else {
+                in = 0;
+            }
         }
-        return cond_block_eval_recursive(state, cur->next, in);
+        if (!cur || !cur->next) {
+            LOG_ERROR("Invalid token position.");
+        }
+        return cond_block_eval_recursive(state, next, in);
     } else {
         report_error(cur->location, cur->pos, "Unexpected token '%.*s'", (int)cur->len, cur->pos);
     }
@@ -1168,7 +1384,8 @@ int cond_block_eval(State *state, Token *command, Token *cond) {
 Token *cond_block_skip(Token *tok) {
     int level = 0;
     LOG_DEBUG("  >> SKIP BLOCK", level);
-    while (tok->type != TKN_EOF) {
+    Token *prev = tok;
+    while (tok && tok->type != TKN_EOF) {
         if (token_equal(tok, "#")) {
             Token *command = tok->next;
             if (token_equal(command, "if") || token_equal(command, "ifdef") || token_equal(command, "ifndef")) {
@@ -1184,9 +1401,10 @@ Token *cond_block_skip(Token *tok) {
                 }
             }
         }
+        prev = tok;
         tok = tok->next;
     }
-    return tok;
+    return prev;
 }
 
 Token *manage_if_block(State *state, Token *command) {
@@ -1241,7 +1459,7 @@ Token *manage_else_block(State *state, Token *command) {
         report_error(command->location, command->pos, "#else without #if block");
     }
 
-    Token *tok = command->next;
+    Token *tok = command;
     int val = scope.valid_block;
     state->cond_scopes.items[state->cond_scopes.count - 1].last = *command;
 
@@ -1258,13 +1476,15 @@ Token *manage_endif_block(State *state, Token *command) {
     if (state->cond_scopes.count == 0) {
         report_error(command->location, command->pos, "#endif without #if block");
     }
+
+    Token *tok = command;
     ConditionScope scope;
     AC_ARRAY_POP(state->cond_scopes, scope);
     UNUSED(scope);
 
     LOG_DEBUG(" -> cond block (%p) '%.*s' (at level %lu)", command, (int)command->len, command->pos, state->cond_scopes.count);
 
-    return command->next;
+    return tok;
 }
 
 Token *manage_line(State *state, Token *command) {
@@ -1309,7 +1529,7 @@ Token *manage_pragma(State *state, Token *command) {
 }
 
 Token *preprocess(State *state, Token *start) {
-    Token head = {};
+    Token head = {0};
     Token *copy = &head;
     Token *cur = start;
     Token *prev = 0;
@@ -1323,7 +1543,7 @@ Token *preprocess(State *state, Token *start) {
             }
 
             if (token_equal(command, "include")) {
-                cur = manage_include(state, command);
+                cur = manage_include(state, command, &copy);
             } else if (token_equal(command, "define")) {
                 cur = manage_define(state, command);
             } else if (token_equal(command, "undef")) {
@@ -1351,11 +1571,15 @@ Token *preprocess(State *state, Token *start) {
             } else {
                 report_error(cur->location, cur->pos, "Unknown preprocess command.");
             }
+            cur = cur->next;
         } else {
             if (cur->type == TKN_ID) {
                 Macro *m = macro_search(state, cur);
                 if (m) {
-                    cur = macro_expand(state, m, cur);
+                    Token *expanded = macro_expand(state, m, &cur);
+                    token_link(expanded, cur->next);
+                    cur->next = expanded;
+                    cur = cur->next;
                     continue;
                 }
             }
@@ -1598,28 +1822,13 @@ int main(int argc, const char **argv) {
             return 1;
         }
 
+        LOG_INFO("");
+        token_dump_full(tok);
+        LOG_INFO("");
+
         if (state.cond_scopes.count > 0) {
             ConditionScope scope = state.cond_scopes.items[state.cond_scopes.count - 1];
             report_error(scope.last.location, scope.last.pos, "Open cond block! (%ul)", state.cond_scopes.count - 1);
-        }
-
-        token_dump_full(tok);
-
-        AC_ARRAY_FOREACH(MacroPtr, it, state.macros) {
-            int idx = (int)(it - state.macros.items);
-            LOG_INFO("Macro %d) '%.*s'", idx, (int)(*it)->name->len, (*it)->name->pos);
-            if ((*it)->args.count > 0) {
-                LOG_INFO("    ARGS:");
-                AC_ARRAY_FOREACH(TokenPtr, a, (*it)->args) {
-                    LOG_INFO("    - '%.*s'", (int)(*a)->len, (*a)->pos);
-                }
-            }
-            if ((*it)->body.count > 0) {
-                LOG_INFO("    BODY:");
-                AC_ARRAY_FOREACH(TokenPtr, b, (*it)->body) {
-                    LOG_INFO("    - '%.*s'", (int)(*b)->len, (*b)->pos);
-                }
-            }
         }
 
         // TODO: generate asm code
