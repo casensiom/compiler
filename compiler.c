@@ -519,6 +519,7 @@ static Macro *macro_read(State *state, Token **tok) {
     int is_variadic = 0;
     TokenPtrArray args = {0};
     Token *body = NULL;
+    int skip_body = 0;
 
     // collect macro arguments
     Token *it = name->next;
@@ -526,6 +527,7 @@ static Macro *macro_read(State *state, Token **tok) {
         if (it->type == TKN_ID) {
             AC_ARRAY_PUSH(args, token_copy(it));
         } else if (token_equal(it, ")")) {
+            skip_body = it->is_eol;
             it = it->next; // stop
             break;
         } else if (token_equal(it, "...")) {
@@ -539,9 +541,11 @@ static Macro *macro_read(State *state, Token **tok) {
     }
 
     // collect macro body
-    if (!name->is_eol) {
+    if (!skip_body && !name->is_eol) {
         if (it && it->type != TKN_EOF) {
             body = token_copy_until_eol(&it);
+        } else {
+            report_error(name->location, name->pos, "Expected macro body.");
         }
     } else {
         it = name; // rewind one token
@@ -615,7 +619,7 @@ static TokenPtrArray macro_collect_args(State *state, Macro *macro, Token **tok)
                 // fulfill the variadics
                 p = p->next = token_copy(*tok);
             } else {
-                AC_ARRAY_PUSH(params, copy.next);
+                AC_ARRAY_PUSH(params, copy.next); // TODO: should expand it
                 copy.next = NULL;
                 p = &copy;
             }
@@ -625,7 +629,7 @@ static TokenPtrArray macro_collect_args(State *state, Macro *macro, Token **tok)
         *tok = (*tok)->next;
     }
     if (copy.next) {
-        AC_ARRAY_PUSH(params, copy.next);
+        AC_ARRAY_PUSH(params, copy.next); // TODO: should expand it
     }
     return params;
 }
@@ -843,6 +847,14 @@ static size_t read_escape_sequence(const char *pos) {
         len = 2 + 4;
     } else if (*p == 'U' && string_ensure_len(p, 1 + 8)) {
         len = 2 + 8;
+    } else if (isdigit(*p)) {
+        len = 2;
+        if (isdigit(*(p++))) {
+            len++;
+        }
+        if (isdigit(*(p++))) {
+            len++;
+        }
     }
     return len;
 }
@@ -1242,6 +1254,7 @@ Token *manage_include(State *state, Token *command, Token **copy) {
         file_release_content(&file);
         return tok;
     }
+    LOG_DEBUG("%*s > INCLUDE: %s (level: %lu)", (int)state->cond_scopes.count, "", filename, state->cond_scopes.count);
 
     // load file
     if (!file_read_content(&file)) {
@@ -1251,6 +1264,8 @@ Token *manage_include(State *state, Token *command, Token **copy) {
 
     // process file
     Token *included = process_file_content(state, file);
+    LOG_DEBUG("%*s < INCLUDED: %s (level: %lu) <- %s symbols", (int)state->cond_scopes.count, "", filename, state->cond_scopes.count, (!included || included->type == TKN_EOF) ? "has" : "empty");
+
     if (!included || included->type == TKN_EOF) {
         return tok;
     }
@@ -1320,6 +1335,8 @@ int cond_block_eval_recursive(State *state, Token *cur, int in) {
             return in - cond_block_eval_recursive(state, cur->next, 0);
         } else if (token_equal(cur, "==")) {
             return in == cond_block_eval_recursive(state, cur->next, 0);
+        } else if (token_equal(cur, "!=")) {
+            return in != cond_block_eval_recursive(state, cur->next, 0);
         } else if (token_equal(cur, "<")) {
             return in < cond_block_eval_recursive(state, cur->next, 0);
         } else if (token_equal(cur, ">")) {
@@ -1336,7 +1353,7 @@ int cond_block_eval_recursive(State *state, Token *cur, int in) {
             AC_ARRAY_FOREACH(FilePtr, f, state->included) {
                 LOG_INFO("included: %s", (*f)->fullpath);
             }
-            report_error(cur->location, cur->pos, "Unexpected token '%.*s'", (int)cur->len, cur->pos);
+            report_error(cur->location, cur->pos, "Unexpected conditional token '%.*s'", (int)cur->len, cur->pos);
         }
     } else if (cur->type == TKN_ID) {
         Macro *m = macro_search(state, cur);
@@ -1356,9 +1373,6 @@ int cond_block_eval_recursive(State *state, Token *cur, int in) {
             } else {
                 in = 0;
             }
-        }
-        if (!cur || !cur->next) {
-            LOG_ERROR("Invalid token position.");
         }
         return cond_block_eval_recursive(state, next, in);
     } else {
@@ -1577,9 +1591,11 @@ Token *preprocess(State *state, Token *start) {
                 Macro *m = macro_search(state, cur);
                 if (m) {
                     Token *expanded = macro_expand(state, m, &cur);
-                    token_link(expanded, cur->next);
-                    cur->next = expanded;
-                    cur = cur->next;
+                    if (expanded) {
+                        token_link(expanded, cur->next);
+                        cur->next = expanded;
+                        cur = cur->next;
+                    }
                     continue;
                 }
             }
@@ -1707,7 +1723,6 @@ static int file_search(State *state, const char *file_path, File *file, int sear
         file_release_content(file);
         for (int i = (int)start; i >= 0; i--) {
             const char *current_path = state->search_paths.items[i];
-            LOG_INFO(" >>> %lu) Searching for %s in %s (is_local: %d)", i, file_path, current_path, search_local);
 
             file->fullpath = path_join(current_path, file_path);
             file->filename = file->fullpath + strlen(current_path) + 1;
@@ -1778,7 +1793,8 @@ Token *process_file_content(State *state, File file) {
     Token *tok = tokenize(state, copy);
     if (tok == NULL)
         return NULL;
-    token_dump_full(tok);
+    // token_dump_full(tok);
+
     Token *ret = preprocess(state, tok);
     token_delete(tok);
     return ret;
