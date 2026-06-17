@@ -711,7 +711,7 @@ static Token *macro_expand(State *state, Macro *macro, Token **tok) {
                     Token *first = token_copy(it);
                     first->next = token_clone(params.items[macro->args.count]);
                     candidate = first;
-                    it = it->next->next->next;
+                    it = it->next->next;
                 } else {
                     it = it->next->next->next;
                     continue;
