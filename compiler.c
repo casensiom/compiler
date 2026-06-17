@@ -335,14 +335,12 @@ static Token *token_new(TokenKind type, const char *s, const char *e, TokenLocat
     return ret;
 }
 
-#if 0
 static Token *token_from_string(TokenKind type, const char *str, TokenLocation loc) {
     size_t len = strlen(str);
     Token *ret = token_new(type, str, str + len, loc);
     ret->str = str;
     return ret;
 }
-#endif
 
 static Token *token_copy(Token *orig) {
     Token *ret = (Token *)calloc(1, sizeof(Token));
@@ -675,11 +673,24 @@ static Token *macro_expand(State *state, Macro *macro, Token **tok) {
         report_error(macro->name->location, macro->name->pos, "Invalid macro usage.");
     }
 
+    Token *it = *tok;
+    if (token_equal(it, "__FILE__")) {
+        return token_from_string(TKN_STR, string_format("\"%s\"", it->location.file->filename), it->location);
+    } else if (token_equal(it, "__LINE__")) {
+        return token_from_string(TKN_NUM, string_format("%lu", it->location.line), it->location);
+    } else if (token_equal(it, "__COLUMN__")) {
+        return token_from_string(TKN_NUM, string_format("%lu", it->location.column), it->location);
+    } else if (token_equal(it, "__DATE__")) {
+        return token_from_string(TKN_STR, string_format("\"%s\"", state->info.date), it->location);
+    } else if (token_equal(it, "__TIME__")) {
+        return token_from_string(TKN_STR, string_format("\"%s\"", state->info.time), it->location);
+    }
+
     Token head = {0};
     Token *copy = &head;
     TokenPtrArray params = macro_collect_args(state, macro, tok);
 
-    Token *it = macro->body;
+    it = macro->body;
     while (it) {
         if (it->type == TKN_EOF) {
             break;
@@ -802,7 +813,7 @@ static void state_cleanup(State *state) {
     state->info.system_path_idx = 0;
 }
 
-static void state_dump(State *state) {
+void state_dump(State *state) {
     AC_ARRAY_FOREACH(MacroPtr, it, state->macros) {
         int idx = (int)(it - state->macros.items);
         LOG_INFO("Macro %d) '%.*s'", idx, (int)(*it)->name->len, (*it)->name->pos);
