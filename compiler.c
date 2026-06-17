@@ -515,10 +515,11 @@ static Macro *macro_read(State *state, Token **tok) {
     UNUSED(state);
     // process macro
     Token *name = *tok;
-    int is_func = !name->has_spaces && token_equal(name->next, "(");
+    int is_func = !name->has_spaces && !name->is_eol && token_equal(name->next, "(");
     int is_variadic = 0;
     TokenPtrArray args = {0};
     Token *body = NULL;
+    Token *before_body = NULL;
     int skip_body = 0;
 
     // collect macro arguments
@@ -528,6 +529,7 @@ static Macro *macro_read(State *state, Token **tok) {
             AC_ARRAY_PUSH(args, token_copy(it));
         } else if (token_equal(it, ")")) {
             skip_body = it->is_eol;
+            before_body = it;
             it = it->next; // stop
             break;
         } else if (token_equal(it, "...")) {
@@ -541,14 +543,16 @@ static Macro *macro_read(State *state, Token **tok) {
     }
 
     // collect macro body
-    if (!skip_body && !name->is_eol) {
+    if (name->is_eol) {
+        it = name;
+    } else if (is_func && skip_body) {
+        it = before_body;
+    } else {
         if (it && it->type != TKN_EOF) {
             body = token_copy_until_eol(&it);
         } else {
             report_error(name->location, name->pos, "Expected macro body.");
         }
-    } else {
-        it = name; // rewind one token
     }
 
     Macro *m = macro_new();
