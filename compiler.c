@@ -764,7 +764,6 @@ static void state_init(State *state) {
     state->info.pwd = path_current_dir();
 
     size_t len = strlen(macro_names);
-
     const char *filename = strdup(__FILE__);
     File file = {.content = strdup(macro_names),
                  .content_size = len,
@@ -1171,7 +1170,7 @@ static Token *tokenize(State *state, File *file) {
             } while (1);
             continue;
         }
-        if (p[0] == '\\' && p[1] == '\n') // TODO: remove this check, that should  be part of the pre cleaning
+        if (p[0] == '\\' && p[1] == '\n') // new line skipping
         {
             p += 2;
             loc.column = 0;
@@ -1697,6 +1696,14 @@ static void file_delete(File *file) {
 }
 
 static int file_search(State *state, const char *file_path, File *file, int search_local) {
+    // TODO: Organize better the search, use this pseudo-code:
+    // if is_local
+    //   if is_absolute -> load
+    //   elif exist(current_path + file_path) -> load
+    // else
+    //   foreach(sys_path)
+    //     if exists(sys_path + filepath) -> load
+
     int ret = 0;
 
     file->filename = NULL;
@@ -1721,7 +1728,7 @@ static int file_search(State *state, const char *file_path, File *file, int sear
 
         ret = 1;
     } else {
-        // TODO: Implement search in local and/or system paths
+        // Implements search in local and/or system paths
         // state->search_paths has all the include paths:
         // - The paths sould be ordered first should be the sistem paths, then the current path (pwd), then the inherited ones
         // - The loop must traverse the items in reverse order, the more recent added the first.
@@ -1813,15 +1820,13 @@ Token *process_file_content(State *state, File file) {
 }
 
 Token *process_file(State *state, const char *filename, int search_local) {
-    UNUSED(search_local);
-    // TODO: Manage search paths
+    // TODO: Find a better way to load from file. Unify this method with manage_include
     File file = {0};
     if (!file_search(state, filename, &file, search_local)) {
         LOG_ERROR("Can't locate the file '%s' within the search paths [%lu in total]", filename, state->search_paths.count);
         return NULL;
     }
 
-    //
     if (!file_read_content(&file)) {
         return NULL;
     }
