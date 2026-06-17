@@ -587,7 +587,6 @@ static TokenPtrArray macro_collect_args(State *state, Macro *macro, Token **tok)
     }
 
     if (!macro->is_func) {
-        *tok = (*tok)->next;
         return params;
     }
 
@@ -1357,13 +1356,11 @@ int cond_block_eval_recursive(State *state, Token *cur, int in) {
         }
     } else if (cur->type == TKN_ID) {
         Macro *m = macro_search(state, cur);
-        Token *next = cur->next;
         if (m) {
             if (m->body) {
                 Token *expanded = macro_expand(state, m, &cur);
                 in = cond_block_eval_recursive(state, expanded, 0);
                 token_delete(expanded);
-                next = cur;
             } else {
                 in = 1;
             }
@@ -1374,7 +1371,7 @@ int cond_block_eval_recursive(State *state, Token *cur, int in) {
                 in = 0;
             }
         }
-        return cond_block_eval_recursive(state, next, in);
+        return cond_block_eval_recursive(state, cur->next, in);
     } else {
         report_error(cur->location, cur->pos, "Unexpected token '%.*s'", (int)cur->len, cur->pos);
     }
@@ -1594,8 +1591,8 @@ Token *preprocess(State *state, Token *start) {
                     if (expanded) {
                         token_link(expanded, cur->next);
                         cur->next = expanded;
-                        cur = cur->next;
                     }
+                    cur = cur->next;
                     continue;
                 }
             }
