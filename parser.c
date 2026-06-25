@@ -7,7 +7,7 @@
 typedef struct Token {
     const char *pos;
     size_t len;
-    Token *next;
+    struct Token *next;
 } Token;
 
 typedef enum NodeType {
@@ -99,9 +99,42 @@ typedef struct Node {
 
 } Node;
 
+// forwaard declaration
+Node *parse_expression(Token **tok);
+Node *parse_type_name(Token **tok) { return 0; }
+Node *parse_argument_expression_list(Token **tok);
+Node *parse_assignment_expression(Token **tok);
+Node *parse_cast_expression(Token **tok);
+Node *parse_exclusive_or_expression(Token **tok);
+Node *parse_assignment_operator(Token **tok);
+
+// TODO: implement
+Node *parse_initializer_list(Token **tok) { return 0; }
+Node *node_make_identifier(Token *tok) { return 0; }
+Node *node_make_constant(Token *tok) { return 0; }
+Node *node_make_string(Node *n1, Node *n2) { return 0; }
+Node *node_make_array_index(Node *n1, Node *n2) { return 0; }
+Node *node_make_invoke_arguments(Node *n1, Node *n2) { return 0; }
+Node *node_make_member_access(Node *n1, Node *n2) { return 0; }
+Node *node_make_pointer_access(Node *n1, Node *n2) { return 0; }
+Node *node_make_post_increment(Node *n1) { return 0; }
+Node *node_make_post_decrement(Node *n1) { return 0; }
+Node *node_make_compound(Node *n1, Node *n2) { return 0; }
+Node *make_node_postfix(Node *n1, Node *n2) { return 0; }
+Node *make_node_argument_expression_list(Node *n1, Node *n2) { return 0; }
+NodeType node_type_from_token(Token *token) { return 0; }
+Node *make_node_unary_op(Token *token) { return 0; }
+Node *make_node_unary(Node *n1, Node *n2) { return 0; }
+Node *make_node_cast(Node *n1, Node *n2) { return 0; }
+Node *make_node_binary_op(Node *n1, NodeType type, Node *n2) { return 0; }
+Node *make_node_binary(Node *n1, Node *op, Node *n2) { return 0; }
+Node *make_node_conditional(Node *n1, Node *n2, Node *n3) { return 0; }
+Node *make_node_assignment(Token *token) { return 0; }
+Node *make_node(Node *n1, Node *n2) { return 0; }
+
 void report_error();
 int token_equal(Token *, const char *);
-
+int token_equal_any(Token *, ...);
 // repeated code could be sustituted by these methods
 int token_cursor_optional(Token **tok, const char *name) {
     if (token_equal(*tok, name)) {
@@ -143,16 +176,207 @@ void token_cursor_mandatory(Token **tok, const char *name) {
  * CONSTANT HEX:          0[xX]{H}+{IS}?
  * CONSTANT OCT:          0{D}+{IS}?
  * CONSTANT DEC:          {D}+{IS}?
- * CONSTANT CHAR:         L?'(\\.|[^\\'])+'
  * CONSTANT FLOAT:        {D}+{E}{FS}?
  * CONSTANT FLOAT:        {D}*"."{D}+({E})?{FS}?
  * CONSTANT FLOAT:        {D}+"."{D}*({E})?{FS}?
+ * CONSTANT CHAR:         L?'(\\.|[^\\'])+'
  * STRING_LITERAL:        L?\"(\\.|[^\\"])*\"
  *
  */
 
+// IDENTIFIER:            {L}({L}|{D})*
+Node *parse_identifier(Token **token) {
+    Node *ret = 0;
+    Token *tok = *token;
+    if (!tok) {
+        report_error();
+    }
+
+    size_t l = tok->len;
+    const char *p = tok->pos;
+    const char *end = p + l;
+
+    if (isalpha(*p)) {
+        while (p + 1 < end && isalnum(*p)) {
+            p++;
+        }
+    }
+    if (p == end) {
+        ret = node_make_identifier(tok);
+        tok = tok->next;
+    }
+
+    *token = tok;
+    return ret;
+}
+
+// {CP}?"'"([^'\\\n]|{ES})+"'"
+Node *parse_constant_char(Token **token) {
+    Node *ret = 0;
+    Token *tok = *token;
+    if (!tok) {
+        report_error();
+    }
+
+    size_t l = tok->len;
+    const char *p = tok->pos;
+    const char *end = p + l;
+
+    if (p && (*p == 'u' || *p == 'U' || *p == 'L')) {
+        p++;
+    }
+
+    if (p && *p == '\'') {
+        p++;
+        // TODO: implement following specs
+        while (p && p < end && *p != '\'') {
+            if (*p == '\n') {
+                report_error();
+            }
+            p++;
+        }
+        if (p && *p != '\'') {
+            return 0;
+        }
+        p++;
+    }
+
+    if (p == end) {
+        ret = node_make_constant(tok);
+        tok = tok->next;
+    }
+
+    *token = tok;
+    return ret;
+}
+
+// D   [0-9]
+// NZ  [1-9]
+// H   [a-fA-F0-9]
+// HP  (0[xX])
+// E   ([Ee][+-]?{D}+)
+// P   ([Pp][+-]?{D}+)
+// FS  (f|F|l|L)
+
+// {HP}{H}+{IS}?
+// {NZ}{D}*{IS}?
+// "0"{O}*{IS}?
+// {D}+{E}{FS}?
+// {D}*"."{D}+{E}?{FS}?
+// {D}+"."{E}?{FS}?
+// {HP}{H}+{P}{FS}?
+// {HP}{H}*"."{H}+{P}{FS}?
+// {HP}{H}+"."{P}{FS}?
+Node *parse_constant_number(Token **token) {
+    Node *ret = 0;
+    Token *tok = *token;
+    if (!tok) {
+        report_error();
+    }
+
+    size_t l = tok->len;
+    const char *p = tok->pos;
+    const char *end = p + l;
+
+    // ([0-9]+(\.[0-9]*)?|\.[0-9]+)[eE][+-]?[0-9]+
+    if (isdigit(p[0]) || (p[0] == '.' && isdigit(p[1]))) {
+        const char *q = p;
+        int has_dot = 0;
+        int has_exp = 0;
+        int has_sig = 0;
+        int is_hex = 0;
+        do {
+            if (p[0] == '.') {
+                if (has_dot) {
+                    report_error(); // "Invalid dot in decimal number.";
+                }
+                if (has_exp) {
+                    report_error(); // "Invalid dot in exponent.";
+                }
+                has_dot = 1;
+            } else if (p[0] == 'x' || p[0] == 'X') {
+                if (is_hex) {
+                    report_error(); // "Invalid hexadecimal value in number.";
+                }
+                is_hex = 1;
+            } else if (p[0] == 'e' || p[0] == 'E' || p[0] == 'p' || p[0] == 'P') {
+                p++;
+                if (has_exp) {
+                    report_error(); // "Invalid exponent in scientific notation";
+                }
+                has_exp = 1;
+                if (p[0] == '+' || p[0] == '-') {
+                    if (has_sig) {
+                        report_error(); //  "Invalid sign in scientific notation";
+                    }
+                    has_sig = 1;
+                    if (p[1] == '\0') {
+                        report_error(); //  "Unexpected end of file after exponent sign.";
+                    } else if (!isdigit(p[1])) {
+                        report_error(); //  "Invalid character after exponent sign.";
+                    }
+                } else if (!isdigit(p[0])) {
+                    report_error(); //  "Invalid character after exponent.";
+                }
+            } else if (p[0] == 'f' || p[0] == 'F' || p[0] == 'l' || p[0] == 'L') {
+                if (has_exp && p == end) {
+                }
+            } else {
+                if ((is_hex && !isxdigit(*p)) || (!is_hex && !isdigit(*p))) {
+                    break;
+                }
+            }
+            p++;
+        } while (p < end);
+    }
+
+    if (p == end) {
+        ret = node_make_constant(tok);
+        tok = tok->next;
+    }
+
+    *token = tok;
+    return ret;
+}
+
+Node *parse_constant(Token **token) {
+    Node *ret = 0;
+    Token *tok = *token;
+    if (!tok) {
+        report_error();
+    }
+
+    ret = parse_constant_number(&tok);
+    if (!ret) {
+        ret = parse_constant_char(&tok);
+    }
+
+    *token = tok;
+    return ret;
+}
+
+Node *parse_string(Token **token) {
+    Node *ret = 0;
+    Token *tok = *token;
+    if (!tok) {
+        report_error();
+    }
+
+    size_t l = tok->len;
+    const char *p = tok->pos;
+    const char *end = p + l;
+
+    if (p[0] == '"' && end[0] == '"') {
+        ret = node_make_constant(tok);
+        tok = tok->next;
+        *token = tok;
+    }
+
+    return ret;
+}
+
 // primary-expression = identifier | constant | string-literal+ | "(" expression ")"
-Node *parse_postfix_expression(Token **token) {
+Node *parse_primary_expression(Token **token) {
     Node *ret = 0;
     Token *tok = *token;
     if (!tok) {
@@ -248,13 +472,13 @@ Node *parse_postfix_expression(Token **token) {
                 report_error();
             }
             next = node_make_pointer_access(ret, property);
-        } else if (token_equal_any(tok, "++")) {
+        } else if (token_equal(tok, "++")) {
             tok = tok->next;
             next = node_make_post_increment(ret);
-        } else if (token_equal_any(tok, "--")) {
+        } else if (token_equal(tok, "--")) {
             tok = tok->next;
             next = node_make_post_decrement(ret);
-        } else if (token_equal_any(tok, "(")) { // "(" type-name ")" "{" initializer-list ","? "}"
+        } else if (token_equal(tok, "(")) { // "(" type-name ")" "{" initializer-list ","? "}"
             tok = tok->next;
             Node *type_name = parse_type_name(&tok);
             if (!token_equal(tok, ")")) {
@@ -369,7 +593,7 @@ Node *parse_unary_operator(Token **token) {
 
     Node *ret = 0;
     if (token_equal_any(tok, "&", "*", "+", "-", "~", "!")) {
-        ret = make_node_unary(tok);
+        ret = make_node_unary_op(tok);
         tok = tok->next;
     }
 
@@ -416,7 +640,7 @@ Node *parse_multiplicative_expression(Token **token) {
     while (tok && (token_equal_any(tok, "*", "/", "%"))) {
         NodeType type = node_type_from_token(tok);
         tok = tok->next;
-        ret = make_node_binary(ret, type, parse_cast_expression(&tok));
+        ret = make_node_binary_op(ret, type, parse_cast_expression(&tok));
     }
     *token = tok;
     return ret;
@@ -433,7 +657,7 @@ Node *parse_additive_expression(Token **token) {
     while (tok && (token_equal_any(tok, "+", "-"))) {
         int is_plus = token_equal(tok, "+");
         tok = tok->next;
-        ret = make_node_binary(ret, is_plus ? NT_PLUS_SIGN : NT_MINUS_SIGN, parse_multiplicative_expression(&tok));
+        ret = make_node_binary_op(ret, is_plus ? NT_PLUS_SIGN : NT_MINUS_SIGN, parse_multiplicative_expression(&tok));
     }
     *token = tok;
     return ret;
@@ -450,7 +674,7 @@ Node *parse_shift_expression(Token **token) {
     while (tok && (token_equal_any(tok, "<<", ">>"))) {
         int is_left = token_equal(tok, "<<");
         tok = tok->next;
-        ret = make_node_binary(ret, is_left ? NT_LEFT_OP : NT_RIGHT_OP, parse_additive_expression(&tok));
+        ret = make_node_binary_op(ret, is_left ? NT_LEFT_OP : NT_RIGHT_OP, parse_additive_expression(&tok));
     }
     *token = tok;
     return ret;
@@ -467,7 +691,7 @@ Node *parse_relational_expression(Token **token) {
     while (tok && (token_equal_any(tok, "<", ">", "<=", ">="))) {
         NodeType type = node_type_from_token(tok);
         tok = tok->next;
-        ret = make_node_binary(ret, type, parse_shift_expression(&tok));
+        ret = make_node_binary_op(ret, type, parse_shift_expression(&tok));
     }
     *token = tok;
     return ret;
@@ -484,7 +708,7 @@ Node *parse_equality_expression(Token **token) {
     while (tok && (token_equal_any(tok, "==", "!="))) {
         int is_equal = token_equal(tok, "==");
         tok = tok->next;
-        ret = make_node_binary(ret, is_equal ? NT_EQ_OP : NT_NE_OP, parse_relational_expression(&tok));
+        ret = make_node_binary_op(ret, is_equal ? NT_EQ_OP : NT_NE_OP, parse_relational_expression(&tok));
     }
     *token = tok;
     return ret;
@@ -500,7 +724,7 @@ Node *parse_and_expression(Token **token) {
     Node *ret = parse_equality_expression(&tok);
     while (tok && token_equal(tok, "&")) {
         tok = tok->next;
-        ret = make_node_binary(ret, NT_AMPERSAND_SIGN, parse_equality_expression(&tok));
+        ret = make_node_binary_op(ret, NT_AMPERSAND_SIGN, parse_equality_expression(&tok));
     }
     *token = tok;
     return ret;
@@ -516,7 +740,7 @@ Node *parse_exclusive_or_expressio(Token **token) {
     Node *ret = parse_and_expression(&tok);
     while (tok && token_equal(tok, "^")) {
         tok = tok->next;
-        ret = make_node_binary(ret, NT_CIRCUMFLEX_SIGN, parse_and_expression(&tok));
+        ret = make_node_binary_op(ret, NT_CIRCUMFLEX_SIGN, parse_and_expression(&tok));
     }
     *token = tok;
     return ret;
@@ -532,7 +756,7 @@ Node *parse_inclusive_or_expression(Token **token) {
     Node *ret = parse_exclusive_or_expression(&tok);
     while (tok && token_equal(tok, "|")) {
         tok = tok->next;
-        ret = make_node_binary(ret, NT_VERTICAL_SIGN, parse_exclusive_or_expression(&tok));
+        ret = make_node_binary_op(ret, NT_VERTICAL_SIGN, parse_exclusive_or_expression(&tok));
     }
     *token = tok;
     return ret;
@@ -548,7 +772,7 @@ Node *parse_logical_and_expression(Token **token) {
     Node *ret = parse_inclusive_or_expression(&tok);
     while (tok && token_equal(tok, "&&")) {
         tok = tok->next;
-        ret = make_node_binary(ret, NT_AND_OP, parse_inclusive_or_expression(&tok));
+        ret = make_node_binary_op(ret, NT_AND_OP, parse_inclusive_or_expression(&tok));
     }
     *token = tok;
     return ret;
@@ -564,7 +788,7 @@ Node *parse_logical_or_expression(Token **token) {
     Node *ret = parse_logical_and_expression(&tok);
     while (tok && token_equal(tok, "||")) {
         tok = tok->next;
-        ret = make_node_binary(ret, NT_OR_OP, parse_logical_and_expression(&tok));
+        ret = make_node_binary_op(ret, NT_OR_OP, parse_logical_and_expression(&tok));
     }
     *token = tok;
     return ret;
@@ -678,14 +902,3 @@ Node *parse_constant_expression(Token **token) {
     *token = tok;
     return ret;
 }
-
-// Node *parse_(Token **token) {
-//     Token *tok = *token;
-//    if(!tok) {
-//        report_error();
-//    }
-//     Node *ret = 0;
-
-//     *token = tok;
-//     return ret;
-// }
